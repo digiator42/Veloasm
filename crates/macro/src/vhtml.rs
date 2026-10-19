@@ -10,12 +10,13 @@
 //!
 //! ```ignore
 //! let root = vhtml! {
+//!     schema { threats_present = false },
 //!     div class="panel" {
 //!         h2 { "Live threats" }
 //!         @Show("threats") {
 //!             ul {
-//!                 @for t in threats {
-//!                     li .critical { t.get("title") }
+//!                 @for t in threats, key = t.id {
+//!                     li .critical { t.title }
 //!                 }
 //!             }
 //!         } @else {
@@ -35,10 +36,33 @@
 //! | `(expr)` or bare `expr` | `Expr::render` | arbitrary Rust; client-only |
 //! | `@if` / `@else if` / `@else` | `Node::If` | Rust decides at build time |
 //! | `@for x in xs { … }` | a `Node::fragment` of rows | see *Loops* below |
+//! | `@for x in xs, key = x.id { … }` | `Node::each` | keyed; moved/patched rows at mount |
+//! | `schema { n = 3, hot } { … }` | a compile-time contract | see *The schema* below |
 //! | `@let y = …;` | a Rust `let` | lexical only |
 //! | `.cls` | `Attr::class_toggle` | Maud's class shorthand |
 //! | `input type="text"` | void element | no block needed |
 //! | `// comment` | dropped | Maud line comments |
+//!
+//! ## The schema
+//!
+//! An optional `schema { … }` header declares the signals an island may name.
+//! String-literal signal ids — the `@Show("count")` form — are checked against
+//! it **while the macro runs**: an id that is not in the schema fails the build
+//! with the exact spelling of the offending reference, instead of mounting a
+//! view that silently renders that branch as null. The runtime counterpart is
+//! still `View::new(name, root).with_signal(…)`; the schema is the macro's
+//! side of the same contract, stated where the typo actually lives.
+//!
+//! ```ignore
+//! vhtml! {
+//!     schema { count = 3, hot },
+//!     p class:hot=("count > 1") { (count) }
+//! }
+//! ```
+//!
+//! The schema is enforcement-through-presence: no header, and `@Show` ids are
+//! checked by nothing but runtime ("an undeclared read renders empty"); a
+//! header turns every literal id in the body into a build-time requirement.
 //!
 //! ## The deliberate departures from Maud
 //!
@@ -69,20 +93,44 @@
 //! body may only use owned values or signals; it cannot borrow a local that
 //! dies with the surrounding function.
 //!
-//! Rows are rebuilt rather than reconciled, so there is no DOM-node reuse
-//! across list updates. That tradeoff is deliberate: reuse requires comparing
-//! row *values*, and a row here is an arbitrary Rust type, not a comparable
-//! `Value`. [`Node::each`](velo_ast::Node::each) is the portable, keyed,
-//! reconciling loop — the one a backend ships as data, and the one to reach for
-//! on a large list.
+//! Rows are rebuilt rather than reconciled — every update re-runs the body and
+//! replaces the fragment wholesale. That tradeoff is deliberate: reuse requires
+//! comparing row *values*, and a row here is an arbitrary Rust type, not a
+//! comparable `Value`. On a list that churns, add a key clause:
+//!
+//! ```ignore
+//! @for r in rows, key = r.id {
+//!     li { r.label }
+//! }
+//! ```
+//!
+//! A keyed `@for` lowers to [`Node::each`](velo_ast::Node::each), the
+//! framework's keyed reconciling loop: rows are matched by key, removed rows
+//! let go of their DOM nodes and their row-scoped effects, and moved rows are
+//! *placed* rather than rebuilt — untouched scroll positions, no re-created
+//! inputs, no lost focus. The key is a value path over the row (`t.id`,
+//! `t.meta.version`, the literal `index`), evaluated as data by the runtime.
+//!
+//! The cost of a key clause is that the body must speak *value*: anything that
+//! touches the row must be a read (`t.name`, `t.get("name")`), a comparison,
+//! arithmetic, boolean logic, or a `format!` whose placeholders are plain
+//! `{}`/`{name}` — because those are the shapes that lower to serializable
+//! [`Expr`](velo_ast::Expr) trees, and the reconciler re-renders rows from a
+//! *template*, not from Rust closures capturing one row per build. A keyed body
+//! that mixes an unsupported Rust shape over the row is rejected at compile
+//! time with the offending expression quoted; splices that do not mention the
+//! row at all stay ordinary Rust.
 //!
 //! ## Portability
 //!
 //! Every `(expr)` splice becomes an [`Expr::Native`](velo_ast::Expr::Native),
-//! and every `@for` becomes a [`Node::Native`](velo_ast::Node::Native) Rust
-//! closure. Neither **can be serialized**, so a `vhtml!` tree is client-only.
-//! To build a view a *backend* can ship, use the `velo_ast` builders directly —
-//! that is the other half of this feature, and the half that crosses the wire.
+//! and every unkeyed `@for` becomes a [`Node::Native`](velo_ast::Node::Native)
+//! Rust closure. Neither **can be serialized**, so a `vhtml!` tree is
+//! client-only. To build a view a *backend* can ship, use the `velo_ast`
+//! builders directly — that is the other half of this feature, and the half
+//! that crosses the wire. (A keyed `@for` whose body touches the row only
+//! through value reads *can* serialize, but a `vhtml!` island is not expected
+//! to try — ship it via a matching `velo_ast` tree when that matters.)
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -91,6 +139,19 @@ use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::{parse_macro_input, Expr as RustExpr, Ident, LitStr, Pat, Token};
+
+/// Two-argument result alias for the lowering code, which reports via row
+/// grammar errors; `Result` stays syn's one-argument alias for the parser.
+type Res<T> = std::result::Result<T, syn::Error>;
+
+/// A comma-separated argument list, for re-parsing macro tokens.
+struct MacroArgs(pub Punctuated<RustExpr, Token![,]>);
+
+impl Parse for MacroArgs {
+    fn parse(input: ParseStream) -> Result<Self> {
+        Ok(MacroArgs(Punctuated::parse_terminated(input)?))
+    }
+}
 
 /// One attribute on an element.
 struct MAttr {
@@ -157,6 +218,9 @@ enum MNode {
         pat: Box<Pat>,
         /// The iterable.
         iter: RustExpr,
+        /// `key = t.path`, spelled at the call site. A `Some` turns the loop
+        /// into [`Node::Each`](velo_ast::Node::Each), the keyed reconciler.
+        key: Option<KeyPath>,
         /// The body, evaluated once per item.
         body: Vec<MNode>,
     },
@@ -164,10 +228,28 @@ enum MNode {
 
 /// The condition of an `@Show`.
 enum ShowCond {
-    /// `@Show("count")` — a portable signal read.
-    Signal(String),
+    /// `@Show("count")` — a portable signal read. The literal is kept so the
+    /// schema checker can point at the exact reference it rejects.
+    Signal(LitStr),
     /// `@Show(cond)` or `@Show(move || cond)` — a Rust test.
     Rust(RustExpr),
+}
+
+/// `key = t.id` — the row-identifying clause of a keyed `@for`.
+///
+/// A key is a *value path*: the binding of this (or an enclosing keyed) loop,
+/// then zero or more field steps, so `key = t` is valid — the row itself is the
+/// identity — and `key = index` switches to positional identity explicitly.
+/// Path literals, not expressions: the key has to be evaluable as an
+/// [`Expr`](velo_ast::Expr) for the reconciler to use it, and that limit is
+/// exactly what keeps the difference cheap.
+struct KeyPath {
+    /// The binding the path starts at — `t`, or `index` for positional.
+    base: String,
+    /// Field steps after the base: `t.meta.version` — `["meta", "version"]`.
+    steps: Vec<String>,
+    /// Where the `base` was written, for reporting a missing binding.
+    base_span: proc_macro2::Span,
 }
 
 /// A parsed element.
@@ -181,6 +263,30 @@ struct MElement {
     attrs: Vec<MAttr>,
     /// Child nodes.
     children: Vec<MNode>,
+}
+
+/// The `schema { … }` header — the compile-time signal contract.
+struct Schema {
+    /// Signal ids the island may name, in declaration order.
+    names: Vec<String>,
+    /// Whether the header was written at all. Enforcement is
+    /// through-presence: no header, and literal `@Show` ids are unchecked.
+    present: bool,
+}
+
+/// One loop binding visible to row expressions.
+///
+/// Unkeyed frames exist only so a Rust variable with the same name as a keyed
+/// binding shadows it again — a row expression naming it must not be
+/// rewritten to `r.item(…)`. Depth is not stored: it is the count of keyed
+/// frames newer than the one being read, which is only known at the
+/// reference site.
+#[derive(Clone)]
+struct Frame {
+    name: String,
+    /// `(item, i)` patterns bind the row index as `i`.
+    index: Option<String>,
+    keyed: bool,
 }
 // =============================================================================
 // Parsing
@@ -219,7 +325,15 @@ impl Parse for MAttr {
             });
         }
 
-        let first = input.call(Ident::parse_any)?.to_string();
+        let mut first = input.call(Ident::parse_any)?.to_string();
+
+        // `data-id`, `aria-label` — dash-cased HTML names are one name.
+        while input.peek(Token![-]) && input.peek2(syn::Ident) {
+            input.parse::<Token![-]>()?;
+            let seg = input.call(Ident::parse_any)?.to_string();
+            first.push('-');
+            first.push_str(&seg);
+        }
 
         // Two `name:value` forms, and only two. Anything else with a colon is
         // a mistake worth reporting rather than silently misreading — which is
@@ -454,7 +568,7 @@ fn parse_show_cond(input: ParseStream) -> Result<ShowCond> {
     let content;
     syn::parenthesized!(content in input);
     if content.peek(LitStr) {
-        return Ok(ShowCond::Signal(content.parse::<LitStr>()?.value()));
+        return Ok(ShowCond::Signal(content.parse::<LitStr>()?));
     }
     Ok(ShowCond::Rust(content.parse()?))
 }
@@ -502,10 +616,65 @@ fn parse_for(input: ParseStream) -> Result<MNode> {
     let pat = Pat::parse_single(input)?;
     input.parse::<Token![in]>()?;
     let iter: RustExpr = input.parse()?;
+
+    // Optional `, key = t.path`. Read *before* the body, since it must not be
+    // mistaken for the first child of the `{ … }`.
+    let key = if input.peek(Token![,]) {
+        input.parse::<Token![,]>()?;
+        let kw = input.call(Ident::parse_any)?.to_string();
+        if kw != "key" {
+            return Err(syn::Error::new(
+                input.span(),
+                format!(
+                    "vhtml: expected `key = …` after the iterable in @for; `{kw}` is not a loop clause"
+                ),
+            ));
+        }
+        input.parse::<Token![=]>()?;
+        let base = input.call(Ident::parse_any)?;
+        let base_span = base.span();
+        let mut steps = Vec::new();
+        while input.peek(Token![.]) {
+            input.parse::<Token![.]>()?;
+            let name = input.call(Ident::parse_any)?.to_string();
+            if input.peek(syn::token::Paren) {
+                // `t.get("id")` — the accessor spelling of a path step; only
+                // `get` with exactly one string literal is a path, anything
+                // else is ordinary Rust this grammar does not speak.
+                if name != "get" {
+                    return Err(syn::Error::new(
+                        base_span,
+                        "vhtml: a `@for` key is a value path — `t.id` / `t.get(\"id\")` / `index`",
+                    ));
+                }
+                let inner;
+                syn::parenthesized!(inner in input);
+                let lit = inner.parse::<LitStr>()?;
+                if !inner.is_empty() {
+                    return Err(syn::Error::new(
+                        inner.span(),
+                        "vhtml: `t.get(…)` in a @for key takes exactly one field name",
+                    ));
+                }
+                steps.push(lit.value());
+            } else {
+                steps.push(name);
+            }
+        }
+        Some(KeyPath {
+            base: base.to_string(),
+            steps,
+            base_span,
+        })
+    } else {
+        None
+    };
+
     let body = parse_block(input)?;
     Ok(MNode::For {
         pat: Box::new(pat),
         iter,
+        key,
         body,
     })
 }
@@ -513,6 +682,474 @@ fn parse_for(input: ParseStream) -> Result<MNode> {
 // =============================================================================
 // Lowering to `velo_ast`
 // =============================================================================
+
+// The row-binding context.
+//
+// Keyed `@for` bodies are lowered to `Node::Each`, whose rows render from a
+// single template — so anything touching the row has to lower to an `Expr`,
+// not to a plain Rust closure capturing one row per build. The `Frame` type
+// is what lets the macro tell a row read (`t.name`) from an unrelated Rust
+// expression (`window.innerWidth`), which is why the two can keep living in
+// the same body without the template silently missing the row.
+
+/// `name` bound to a keyed loop frame: `(depth, is_the_index_alias)`.
+///
+/// Depth is the count of keyed frames *newer* than the one read, which is
+/// what the resolver counts: `Expr::LoopItem(0)` is the innermost row, and
+/// each enclosing keyed loop shifts an outer read one further out. Shadowing
+/// follows Rust's newest-first rule, so unkeyed frames are invisible here —
+/// a keyed read has to name a keyed binding.
+fn keyed_binding(ctx: &[Frame], name: &str) -> Option<(u16, bool)> {
+    let pos = ctx
+        .iter()
+        .rposition(|f| f.keyed && (f.name == name || f.index.as_deref() == Some(name)))?;
+    let is_index = ctx[pos].index.as_deref() == Some(name);
+    let depth = ctx[pos + 1..].iter().filter(|f| f.keyed).count() as u16;
+    Some((depth, is_index))
+}
+
+/// Every variable-shape ident in the expression.
+fn vars_in<'e>(expr: &'e RustExpr, out: &mut Vec<&'e Ident>) {
+    match expr {
+        RustExpr::Path(p) => {
+            if p.path.segments.len() == 1 {
+                out.push(&p.path.segments.last().unwrap().ident);
+            }
+        }
+        RustExpr::Field(f) => vars_in(&f.base, out),
+        RustExpr::Index(i) => {
+            vars_in(&i.expr, out);
+            vars_in(&i.index, out);
+        }
+        RustExpr::MethodCall(m) => {
+            vars_in(&m.receiver, out);
+            m.args.iter().for_each(|a| vars_in(a, out));
+        }
+        RustExpr::Binary(b) => {
+            vars_in(&b.left, out);
+            vars_in(&b.right, out);
+        }
+        RustExpr::Unary(u) => vars_in(&u.expr, out),
+        RustExpr::Paren(p) => vars_in(&p.expr, out),
+        RustExpr::Group(g) => vars_in(&g.expr, out),
+        RustExpr::Tuple(t) => t.elems.iter().for_each(|e| vars_in(e, out)),
+        RustExpr::If(i) => {
+            vars_in(&i.cond, out);
+            block_vars_in(&i.then_branch, out);
+            if let Some((_, e)) = &i.else_branch {
+                vars_in(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Adds the idents referenced by a plain block.
+fn block_vars_in<'b>(block: &'b syn::Block, out: &mut Vec<&'b Ident>) {
+    block.stmts.iter().for_each(|s| match s {
+        syn::Stmt::Expr(e, _) => vars_in(e, out),
+        syn::Stmt::Local(l) => {
+            if let Some(init) = &l.init {
+                vars_in(&init.expr, out);
+            }
+        }
+        _ => {}
+    });
+}
+
+/// The value a block reduces to: exactly one trailing expression. A keyed
+/// `if`'s branches are Rust blocks, but a `Cond` holds expressions — so the
+/// block has to be a single expression statement to have a value at all.
+fn block_tail(block: &syn::Block) -> Res<&RustExpr> {
+    match block.stmts.as_slice() {
+        [syn::Stmt::Expr(e, None)] => Ok(e),
+        _ => Err(syn::Error::new_spanned(block, ROW_GRAMMAR)),
+    }
+}
+
+/// Does the expression even mention a keyed row binding?
+///
+/// Splices that do not are left as ordinary Rust; only the ones that do have
+/// to speak the value grammar. Path shapes are enough: a field chain starts at
+/// one, and literals never mention anything.
+fn mentions_keyed(expr: &RustExpr, ctx: &[Frame]) -> bool {
+    let mut idents = Vec::new();
+    vars_in(expr, &mut idents);
+    idents.iter().any(|id| keyed_binding(ctx, &id.to_string()).is_some())
+}
+
+/// Interpret one row expression to an `Expr` token stream.
+///
+/// `Ok(None)`: the expression never mentions a keyed row — leave it plain
+/// Rust. `Ok(Some(..))`: an `Expr` fragment whose evaluation is the same
+/// value, wherever the template re-renders the row. `Err`: it does mention
+/// the row and nothing in the grammar covers it — report the whole shape so
+/// the author can either rewrite it or drop the key clause.
+///
+/// The grammar is the intersection of "commonly written in a row body" and
+/// "expressible as data": reads, literals, comparisons, arithmetic, boolean
+/// logic, ternaries, and `format!` with plain placeholders. Every other shape
+/// (a method other than `.get`, any call, …) stays an error, on purpose — the
+/// key clause buys the reconciler, and this is its price, stated once here.
+fn interpret(expr: &RustExpr, ctx: &[Frame]) -> Res<Option<TokenStream2>> {
+    let a = ast();
+
+    match expr {
+        // A bare binding: the row itself, or the row index of a `(t, i)` pat.
+        RustExpr::Path(p) => {
+            let id = p.path.segments.last().unwrap().ident.to_string();
+            match keyed_binding(ctx, &id) {
+                Some((depth, true)) => Ok(Some(quote!(#a::Expr::index(#depth)))),
+                Some((depth, false)) => Ok(Some(quote!(#a::Expr::item(#depth)))),
+                None => Ok(None),
+            }
+        }
+
+        // `t.title` — a field chain over a row read (or a deeper nested row).
+        RustExpr::Field(f) => {
+            let Some(base) = interpret(&f.base, ctx)? else {
+                return Ok(None);
+            };
+            match &f.member {
+                syn::Member::Named(ident) => {
+                    let key = ident.to_string();
+                    Ok(Some(quote! {
+                        #a::Expr::Member {
+                            base: ::std::boxed::Box::new(#base),
+                            key: ::std::string::String::from(#key),
+                        }
+                    }))
+                }
+                syn::Member::Unnamed(_) => Err(syn::Error::new_spanned(
+                    &f.member,
+                    "vhtml: a keyed row is a map — read fields by name, not position",
+                )),
+            }
+        }
+
+        // `t.get("title")` — the accessor spelling of a field, matching how a
+        // `Value` is read in plain Rust today. `t.get(i)` indexes a list.
+        RustExpr::MethodCall(m) => {
+            let Some(receiver) = interpret(&m.receiver, ctx)? else {
+                return Ok(None);
+            };
+            let args: Vec<&RustExpr> = m.args.iter().collect();
+            match (m.method.to_string().as_str(), args.as_slice()) {
+                ("get", [RustExpr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })]) => {
+                    let key = s.value();
+                    Ok(Some(quote! {
+                        #a::Expr::Member {
+                            base: ::std::boxed::Box::new(#receiver),
+                            key: ::std::string::String::from(#key),
+                        }
+                    }))
+                }
+                ("get", [only]) => match interpret(only, ctx)? {
+                    Some(key) => Ok(Some(quote! {
+                        #a::Expr::Index {
+                            base: ::std::boxed::Box::new(#receiver),
+                            key: ::std::boxed::Box::new(#key),
+                        }
+                    })),
+                    None => Err(syn::Error::new_spanned(
+                        only,
+                        "vhtml: `get(…)` on the row takes a string field name",
+                    )),
+                },
+                _ => Err(syn::Error::new_spanned(
+                    m,
+                    "vhtml: the only method a keyed row understands is `get(\"field\")` — \
+                     for anything else, drop the `key = …` clause and use the plain Rust loop",
+                )),
+            }
+        }
+
+        RustExpr::Lit(l) => Ok(Some(lit_expr(&l.lit)?)),
+
+        RustExpr::Paren(p) => interpret(&p.expr, ctx),
+
+        RustExpr::Group(g) => interpret(&g.expr, ctx),
+
+        RustExpr::Block(b) => interpret(block_tail(&b.block)?, ctx),
+
+        RustExpr::Binary(b) => {
+            if !mentions_keyed(expr, ctx) {
+                return Ok(None);
+            }
+            let l = required(&b.left, ctx)?;
+            let r = required(&b.right, ctx)?;
+            match &b.op {
+                syn::BinOp::Eq(_) | syn::BinOp::Ne(_) | syn::BinOp::Lt(_)
+                | syn::BinOp::Le(_) | syn::BinOp::Gt(_) | syn::BinOp::Ge(_) => {
+                    let cmp = cmp_ident(&b.op);
+                    Ok(Some(quote! {
+                        #a::Expr::Cmp { op: #a::expr::CmpOp::#cmp, l: ::std::boxed::Box::new(#l), r: ::std::boxed::Box::new(#r) }
+                    }))
+                }
+                syn::BinOp::Add(_) | syn::BinOp::Sub(_) | syn::BinOp::Mul(_) | syn::BinOp::Div(_) => {
+                    let op = arith_ident(&b.op);
+                    Ok(Some(quote! {
+                        #a::Expr::Arith { op: #a::expr::ArithOp::#op, l: ::std::boxed::Box::new(#l), r: ::std::boxed::Box::new(#r) }
+                    }))
+                }
+                syn::BinOp::And(_) => Ok(Some(quote!(#a::Expr::And(::std::vec![#l, #r])))),
+                syn::BinOp::Or(_) => Ok(Some(quote!(#a::Expr::Or(::std::vec![#l, #r])))),
+                _ => Err(syn::Error::new_spanned(b, ROW_GRAMMAR)),
+            }
+        }
+
+        RustExpr::Unary(u) => {
+            if !mentions_keyed(expr, ctx) {
+                return Ok(None);
+            }
+            let inner = required(&u.expr, ctx)?;
+            match u.op {
+                syn::UnOp::Not(_) => Ok(Some(quote!(#a::Expr::Not(::std::boxed::Box::new(#inner))))),
+                syn::UnOp::Neg(_) => Ok(Some(quote!(#a::Expr::Neg(::std::boxed::Box::new(#inner))))),
+                _ => Err(syn::Error::new_spanned(u, ROW_GRAMMAR)),
+            }
+        }
+
+        // Rust's `if` is the ternary here; the AST's `Cond` evaluates exactly
+        // one branch. An `if` with no `else` yields `Expr::Missing`.
+        RustExpr::If(i) => {
+            if !mentions_keyed(expr, ctx) {
+                return Ok(None);
+            }
+            let test = required(&i.cond, ctx)?;
+            let then = required(block_tail(&i.then_branch)?, ctx)?;
+            let otherwise = match &i.else_branch {
+                Some((_, e)) => required(e, ctx)?,
+                None => quote!(#a::Expr::Missing),
+            };
+            Ok(Some(quote! {
+                #a::Expr::Cond {
+                    test: ::std::boxed::Box::new(#test),
+                    then: ::std::boxed::Box::new(#then),
+                    otherwise: ::std::boxed::Box::new(#otherwise),
+                }
+            }))
+        }
+
+        // `format!("{} {}", t.a, b)` — the string building of the "keep plain
+        // Rust" story, in its most common shape. Lowered to `Expr::Format`,
+        // the AST's own templating: literal chunks stay static, placeholders
+        // become the inner reads.
+        RustExpr::Macro(m) if m.mac.path.is_ident("format") => format_expr(m, ctx),
+
+        other => {
+            if mentions_keyed(other, ctx) {
+                Err(syn::Error::new_spanned(other, ROW_GRAMMAR))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// An operand inside a keyed row expression that mentions the row but not in
+/// a readable shape is a hard error at that operand.
+fn required(expr: &RustExpr, ctx: &[Frame]) -> Res<TokenStream2> {
+    match interpret(expr, ctx)? {
+        Some(tokens) => Ok(tokens),
+        None => Err(syn::Error::new_spanned(expr, ROW_GRAMMAR)),
+    }
+}
+
+/// `format!(…)` in a keyed body → [`Expr::Format`](velo_ast::Expr::Format).
+///
+/// Literal chunks stay static and each placeholder becomes the read it
+/// interpolated — `{}`/`{1}` consume the following arguments, `{t}` captures
+/// a keyed binding inline the way the real macro does. Width/precision specs
+/// (`{:.2}`, `{:>5}`) are rejected rather than silently dropped: the AST
+/// template has no formatter, so a spec here would change what renders.
+///
+/// `Ok(None)` when nothing in the template touches the row: a keyed body is
+/// allowed plain `format!` over ordinary Rust state.
+fn format_expr(
+    call: &syn::ExprMacro,
+    ctx: &[Frame],
+) -> Res<Option<TokenStream2>> {
+    let args: Vec<RustExpr> = syn::parse2::<MacroArgs>(call.mac.tokens.clone())?
+        .0
+        .into_iter()
+        .collect();
+
+    let (lit, rest) = match args.split_first() {
+        Some((RustExpr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }), rest)) => (s, rest),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                call,
+                "vhtml: `format!` in a keyed body starts with a string literal",
+            ))
+        }
+    };
+
+    // Walk the template, splitting it into literal chunks and arguments.
+    enum Seg {
+        /// A run of literal text.
+        Lit(String),
+        /// `{}` / `{1}` — the nth argument after the literal.
+        Arg(usize),
+        /// `{t}` — an inline capture of a keyed binding.
+        Inline(String),
+    }
+    let mut segs: Vec<Seg> = Vec::new();
+    let template = lit.value();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                segs.push(Seg::Lit("{".into()));
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                segs.push(Seg::Lit("}".into()));
+            }
+            '{' => {
+                let mut spec = String::new();
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    spec.push(c);
+                }
+                if spec.contains(':') {
+                    return Err(syn::Error::new_spanned(
+                        call,
+                        "vhtml: `{:…}` formatting directives are not part of a keyed row's \
+                         template — the AST has no formatter; drop the `key = …` clause for \
+                         the full `format!`",
+                    ));
+                }
+                let spec = spec.trim().to_string();
+                if spec.is_empty() || spec.chars().all(|c| c.is_ascii_digit()) {
+                    segs.push(Seg::Arg(spec.parse::<usize>().unwrap_or(0)));
+                } else {
+                    segs.push(Seg::Inline(spec));
+                }
+            }
+            _ => {
+                // Fold into the last literal chunk.
+                match segs.last_mut() {
+                    Some(Seg::Lit(s)) => s.push(c),
+                    _ => segs.push(Seg::Lit(c.to_string())),
+                }
+            }
+        }
+    }
+
+    // An inline name that is not a keyed binding is ordinary Rust capture;
+    // the whole expression then stays a plain-Rust render.
+    if segs.iter().any(|s| matches!(s, Seg::Inline(name) if keyed_binding(ctx, name).is_none())) {
+        return Ok(None);
+    }
+
+    let a = ast();
+    let mut parts: Vec<TokenStream2> = Vec::new();
+    let mut chunk = String::new();
+    for seg in &segs {
+        match seg {
+            Seg::Lit(s) => chunk.push_str(s),
+            Seg::Arg(n) => {
+                let arg = rest.get(*n).ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        call,
+                        "vhtml: this `format!` placeholder has no matching argument",
+                    )
+                })?;
+                if !chunk.is_empty() {
+                    parts.push(quote!(#a::Expr::str(#chunk)));
+                    chunk = String::new();
+                }
+                parts.push(required(arg, ctx)?);
+            }
+            Seg::Inline(name) => {
+                let (depth, is_index) = keyed_binding(ctx, name).unwrap();
+                if !chunk.is_empty() {
+                    parts.push(quote!(#a::Expr::str(#chunk)));
+                    chunk = String::new();
+                }
+                if is_index {
+                    parts.push(quote!(#a::Expr::index(#depth)));
+                } else {
+                    parts.push(quote!(#a::Expr::item(#depth)));
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    if !chunk.is_empty() {
+        parts.push(quote!(#a::Expr::str(#chunk)));
+    }
+    Ok(Some(quote! {
+        #a::Expr::Format { parts: ::std::vec![ #(#parts),* ], sep: ::std::string::String::new() }
+    }))
+}
+
+/// The error text every unsupported row shape folds into, pointing the way
+/// back to the plain-Rust loop rather than listing what one shape cannot do.
+const ROW_GRAMMAR: &str = concat!(
+    "vhtml: a keyed `@for` body can only read the row (`t.field`, `t.get(\"field\")`), ",
+    "compare, do arithmetic, `format!` with plain placeholders, or branch — ",
+    "anything touching the row another way still belongs in an unkeyed `@for`, ",
+    "where dropping the `key = …` clause makes the whole body plain Rust again"
+);
+
+/// `BinOp` → `CmpOp` ident.
+fn cmp_ident(op: &syn::BinOp) -> syn::Ident {
+    let name = match op {
+        syn::BinOp::Eq(_) => "Eq",
+        syn::BinOp::Ne(_) => "Ne",
+        syn::BinOp::Lt(_) => "Lt",
+        syn::BinOp::Le(_) => "Le",
+        syn::BinOp::Gt(_) => "Gt",
+        syn::BinOp::Ge(_) => "Ge",
+        _ => unreachable!("checked at the match above"),
+    };
+    proc_macro2::Ident::new(name, proc_macro2::Span::call_site())
+}
+
+/// `BinOp` → `ArithOp` ident.
+fn arith_ident(op: &syn::BinOp) -> syn::Ident {
+    let name = match op {
+        syn::BinOp::Add(_) => "Add",
+        syn::BinOp::Sub(_) => "Sub",
+        syn::BinOp::Mul(_) => "Mul",
+        syn::BinOp::Div(_) => "Div",
+        _ => unreachable!("checked at the match above"),
+    };
+    proc_macro2::Ident::new(name, proc_macro2::Span::call_site())
+}
+
+/// A literal in row position. `2` is a float on the wire (`Value` is always
+/// `f64`), `2 as usize` is how Rust would have written it — the macro folds
+/// the difference, because the author meant a count either way.
+fn lit_expr(lit: &syn::Lit) -> Res<TokenStream2> {
+    let a = ast();
+    match lit {
+        syn::Lit::Bool(b) => {
+            let v = b.value();
+            Ok(quote!(#a::Expr::Bool(#v)))
+        }
+        syn::Lit::Str(s) => {
+            let text = s.value();
+            Ok(quote!(#a::Expr::str(#text)))
+        }
+        syn::Lit::Float(f) => Ok(quote!(#a::Expr::num(#f.value()))),
+        syn::Lit::Int(i) => {
+            let v: f64 = i.base10_parse()?;
+            Ok(quote!(#a::Expr::num(#v)))
+        }
+        _ => Err(syn::Error::new_spanned(
+            lit,
+            "vhtml: keyed rows read strings, numbers, and bools — this literal has no value form",
+        )),
+    }
+}
 
 /// The path a `vhtml!` expansion uses to reach the AST. A local alias keeps the
 /// generated code readable under `cargo expand`.
@@ -541,59 +1178,129 @@ fn emit_test(expr: &RustExpr) -> TokenStream2 {
     }
 }
 
-fn expand_attr(attr: &MAttr) -> TokenStream2 {
+fn expand_attr(attr: &MAttr, ctx: &[Frame]) -> Res<TokenStream2> {
     let a = ast();
     match (&attr.name, &attr.value) {
         (_, Some(AttrValueSrc::ClassLit(cls))) => {
             let cls = cls.as_str();
-            quote! { #a::Attr::class_toggle(#cls, #a::Expr::Bool(true)) }
+            Ok(quote! { #a::Attr::class_toggle(#cls, #a::Expr::Bool(true)) })
         }
         // `class:critical=(cond)` — same toggle, with the condition computed
         // in Rust rather than baked on.
         (_, Some(AttrValueSrc::ClassCond { cls, expr })) => {
             let cls = cls.as_str();
-            let test = emit_test(expr);
-            quote! { #a::Attr::class_toggle(#cls, #test) }
+            let test = lower_splice(expr, ctx, emit_test)?;
+            Ok(quote! { #a::Attr::class_toggle(#cls, #test) })
         }
         // An event binding becomes an EventBinding, not an attribute.
         (_, Some(AttrValueSrc::Splice(expr))) if attr.event.is_some() => {
             let event = attr.event.as_ref().unwrap();
-            quote! { #a::EventBinding::new(#event, (#expr)) }
+            Ok(quote! { #a::EventBinding::new(#event, (#expr)) })
         }
         (name, None) => {
             let name = name.as_str();
-            quote! { #a::Attr::boolean(#name, #a::Expr::Bool(true)) }
+            Ok(quote! { #a::Attr::boolean(#name, #a::Expr::Bool(true)) })
         }
         (name, Some(AttrValueSrc::Lit(lit))) => {
             let name = name.as_str();
             let text = lit.value();
-            if name == "class" {
-                quote! { #a::Attr::stat("class", #text) }
-            } else {
-                quote! { #a::Attr::stat(#name, #text) }
-            }
+            Ok(quote! { #a::Attr::stat(#name, #text) })
         }
         (name, Some(AttrValueSrc::Splice(expr))) => {
-            let rendered = emit_render(expr);
+            let rendered = lower_splice(expr, ctx, emit_render)?;
             let name = name.as_str();
-            quote! { #a::Attr::bound(#name, #rendered) }
+            Ok(quote! { #a::Attr::bound(#name, #rendered) })
         }
     }
 }
 
-fn expand_node(node: &MNode) -> TokenStream2 {
+/// A splice lowered against the row context.
+///
+/// Inside a keyed `@for`, an expression that reads the row has to become an
+/// `Expr` — the template re-renders rows from data, so a closure capturing
+/// one row per build would freeze whatever the *first* row had. Splices that
+/// never mention the row keep the plain-Rust path they have outside loops.
+/// `emit` is that plain-Rust lowering: `emit_render` for text positions,
+/// `emit_test` for conditions.
+fn lower_splice(
+    expr: &RustExpr,
+    ctx: &[Frame],
+    emit: impl Fn(&RustExpr) -> TokenStream2,
+) -> Res<TokenStream2> {
+    if !ctx.is_empty() {
+        if let Some(tokens) = interpret(expr, ctx)? {
+            return Ok(tokens);
+        }
+    }
+    Ok(emit(expr))
+}
+
+/// `key = t.id` → the `Expr` the reconciler evaluates per row.
+///
+/// `index` is the positional identity, spelled as a choice rather than a
+/// default. Any other base must name a keyed binding — this loop's own, or an
+/// enclosing one — and the field steps after it fold into `Expr::Member`.
+fn lower_key(key: &KeyPath, ctx: &[Frame]) -> Res<TokenStream2> {
+    let a = ast();
+    let base = if key.base == "index" && keyed_binding(ctx, "index").is_none() {
+        quote!(#a::Expr::index(0))
+    } else {
+        match keyed_binding(ctx, &key.base) {
+            Some((depth, true)) => quote!(#a::Expr::index(#depth)),
+            Some((depth, false)) => quote!(#a::Expr::item(#depth)),
+            None => {
+                return Err(syn::Error::new(
+                    key.base_span,
+                    format!(
+                        "vhtml: the `@for` key starts at `{}`, which is not a keyed loop binding — \
+                         the key path names this loop's binding (or an enclosing keyed one)",
+                        key.base
+                    ),
+                ))
+            }
+        }
+    };
+    Ok(key.steps.iter().fold(base, |acc, step| {
+        let name = step.clone();
+        quote! {
+            #a::Expr::Member {
+                base: ::std::boxed::Box::new(#acc),
+                key: ::std::string::String::from(#name),
+            }
+        }
+    }))
+}
+
+/// The binding names a keyed `@for` may read: `t`, or `(t, i)`.
+fn row_bindings(pat: &Pat) -> Option<(String, Option<String>)> {
+    match pat {
+        Pat::Ident(i) => Some((i.ident.to_string(), None)),
+        Pat::Tuple(t) => {
+            let mut elems = t.elems.iter().filter_map(|p| match p {
+                Pat::Ident(i) => Some(i.ident.to_string()),
+                _ => None,
+            });
+            match (elems.next(), elems.next(), elems.next()) {
+                (Some(name), index, None) => Some((name, index)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn expand_node(node: &MNode, ctx: &[Frame]) -> Res<TokenStream2> {
     let a = ast();
     match node {
         MNode::Text(lit) => {
             let text = lit.value();
-            quote! { #a::Node::text(#text) }
+            Ok(quote! { #a::Node::text(#text) })
         }
 
         MNode::Splice(expr) => {
-            let rendered = emit_render(expr);
-            quote! { #a::Node::text(#rendered) }
+            let rendered = lower_splice(expr, ctx, emit_render)?;
+            Ok(quote! { #a::Node::text(#rendered) })
         }
-
 
         MNode::If {
             test,
@@ -601,14 +1308,17 @@ fn expand_node(node: &MNode) -> TokenStream2 {
             otherwise,
             has_else,
         } => {
-            let cond = emit_test(test);
-            let then_tokens = expand_children(then);
+            // Build-time in Maud, but inside a keyed body a condition over the
+            // row cannot be decided at build time — it lowers to the AST's
+            // conditional, same as `@Show`'s Rust form does.
+            let cond = lower_splice(test, ctx, emit_test)?;
+            let then_tokens = expand_children(then, ctx)?;
             let else_tokens = if *has_else {
-                expand_children(otherwise)
+                expand_children(otherwise, ctx)?
             } else {
                 quote!(#a::Node::Missing)
             };
-            quote! { #a::Node::cond(#cond, #then_tokens, #else_tokens) }
+            Ok(quote! { #a::Node::cond(#cond, #then_tokens, #else_tokens) })
         }
 
         MNode::Show {
@@ -620,53 +1330,100 @@ fn expand_node(node: &MNode) -> TokenStream2 {
             let cond = match when {
                 // A string literal is a signal id: portable, and the only form
                 // that can ship to a browser as JSON.
-                ShowCond::Signal(id) => quote! { #a::Expr::signal(#id) },
-                ShowCond::Rust(expr) => emit_test(expr),
+                ShowCond::Signal(lit) => {
+                    let id = lit.value();
+                    quote! { #a::Expr::signal(#id) }
+                }
+                ShowCond::Rust(expr) => lower_splice(expr, ctx, emit_test)?,
             };
-            let then_tokens = expand_children(then);
+            let then_tokens = expand_children(then, ctx)?;
             let fallback = if *has_else {
-                expand_children(otherwise)
+                expand_children(otherwise, ctx)?
             } else {
                 quote!(#a::Node::Missing)
             };
-            quote! { #a::Node::show(#cond, #then_tokens, #fallback) }
+            Ok(quote! { #a::Node::show(#cond, #then_tokens, #fallback) })
         }
 
-        // The loop body is re-evaluated inside an effect, so a signal read while
-        // building the rows (`@for t in threats.get()`) re-runs the whole loop
-        // and the list updates in place. This is what keeps Maud's plain-Rust
-        // loop body — loop variable, field access, `format!` — instead of
-        // forcing it through `Value`.
+        // `@let` renders nothing; it only binds. Hoisted by `expand_children`,
+        // which is why a sibling after it can see the binding. Reached from
+        // here only if someone nests one where there is no sibling scope to
+        // bind for.
+        MNode::Let { .. } => Ok(quote!(#a::Node::Missing)),
+
+        // The unkeyed loop body is re-evaluated inside an effect, so a signal
+        // read while building the rows (`@for t in threats.get()`) re-runs the
+        // whole loop and the list updates in place. This is what keeps Maud's
+        // plain-Rust loop body — loop variable, field access, `format!` —
+        // instead of forcing it through `Value`.
         //
         // The tradeoff is that the closure must be `'static`: a loop body may
         // only use owned values or signals, not borrow a local that dies with
         // the surrounding function. Rust says so plainly at the offending
-        // borrow. For a portable, keyed, reconciling loop use `Node::each`.
-        // `@let` is handled by `expand_children`, which hoists it so the binding
-        // reaches the siblings after it. Reached from here only if someone nests
-        // one where there is no sibling scope to bind for.
-        MNode::Let { .. } => quote!(#a::Node::Missing),
-
-        MNode::For { pat, iter, body } => {
-            let pat = pat.as_ref();
-            let body_tokens = expand_children(body);
-            quote! {
-                #a::Node::native_render(move |__vhr: &dyn #a::expr::Resolver| {
-                    let mut __vhl: ::std::vec::Vec<#a::Node> = ::std::vec::Vec::new();
-                    for #pat in #iter {
-                        __vhl.push(#body_tokens);
-                    }
-                    #a::Node::fragment(__vhl)
+        // borrow.
+        //
+        // The keyed form trades plain Rust for reconciliation: rows become
+        // values, the body becomes one template, and moved rows are placed
+        // rather than rebuilt. See `interpret` for the row grammar.
+        MNode::For { pat, iter, key, body } => match key {
+            None => {
+                let pat = pat.as_ref();
+                let body_tokens = expand_children(body, ctx)?;
+                Ok(quote! {
+                    #a::Node::native_render(move |__vhr: &dyn #a::expr::Resolver| {
+                        let mut __vhl: ::std::vec::Vec<#a::Node> = ::std::vec::Vec::new();
+                        for #pat in #iter {
+                            __vhl.push(#body_tokens);
+                        }
+                        #a::Node::fragment(__vhl)
+                    })
                 })
             }
-        }
+            Some(key) => {
+                let (name, index) =
+                    row_bindings(pat).ok_or_else(|| {
+                        syn::Error::new_spanned(
+                            pat,
+                            "vhtml: a keyed `@for` binds `t`, or `(t, i)` for the index — \
+                             other patterns have no value form",
+                        )
+                    })?;
+
+                // Push this loop's frame, then lower the key and the body
+                // against it. The key resolves with the frame already in
+                // place: its own binding reads as depth 0, exactly as the
+                // reconciler's `eval_keyed` sees it.
+                let mut ctx_here: Vec<Frame> = ctx.to_vec();
+                ctx_here.push(Frame {
+                    name,
+                    index,
+                    keyed: true,
+                });
+
+                // An outer loop's rows are data; the runtime evaluates `items`
+                // against the *enclosing* shim, before this loop's frame exists.
+                // A row-data source (`t.children`) is therefore an `Expr` over
+                // `LoopItem`, while a plain Rust source (`threats.get()`) stays
+                // a native list closure.
+                let items = if mentions_keyed(iter, ctx) {
+                    required(iter, ctx)?
+                } else {
+                    quote!(#a::Expr::native_list(
+                        move |__vhr: &dyn #a::expr::Resolver| #iter
+                    ))
+                };
+                let key_tokens = lower_key(key, &ctx_here)?;
+                let body_tokens = expand_children(body, &ctx_here)?;
+                Ok(quote! { #a::Node::each(#items, #key_tokens, #body_tokens) })
+            }
+        },
 
         MNode::Element(el) => {
             let tag = el.tag.as_str();
             let mut attrs = Vec::new();
             let mut events = Vec::new();
             for attr in &el.attrs {
-                let token = expand_attr(attr);
+                let token = expand_attr(attr, ctx)?;
                 if attr.event.is_some() {
                     events.push(token);
                 } else {
@@ -677,25 +1434,25 @@ fn expand_node(node: &MNode) -> TokenStream2 {
             // children is hoisted into the same scope as its siblings. Mapping
             // each child directly gave every one its own block, and a `@let` in
             // an element body silently never bound.
-            let children = expand_children(&el.children);
+            let children = expand_children(&el.children, ctx)?;
 
             if el.is_component {
-                quote! {
+                Ok(quote! {
                     #a::Node::Component {
                         name: #tag.to_string(),
                         attrs: ::std::vec![ #(#attrs),* ],
                         children: ::std::vec![ #children ],
                     }
-                }
+                })
             } else {
-                quote! {
+                Ok(quote! {
                     #a::Node::Element(#a::Element {
                         tag: #tag.to_string(),
                         attrs: ::std::vec![ #(#attrs),* ],
                         events: ::std::vec![ #(#events),* ],
                         children: ::std::vec![ #children ],
                     })
-                }
+                })
             }
         }
     }
@@ -708,7 +1465,7 @@ fn expand_node(node: &MNode) -> TokenStream2 {
 /// comma-separated fragment gives each `@let` its own `{ … }`, so the binding
 /// would never escape it and every use after the declaration would fail to
 /// compile. Hoisting costs a block and buys the feature working.
-fn expand_children(children: &[MNode]) -> TokenStream2 {
+fn expand_children(children: &[MNode], ctx: &[Frame]) -> Res<TokenStream2> {
     let a = ast();
 
     let mut bindings: Vec<TokenStream2> = Vec::new();
@@ -717,10 +1474,18 @@ fn expand_children(children: &[MNode]) -> TokenStream2 {
         match child {
             MNode::Let { name, value } => {
                 let value = &**value;
-                // `@let` renders nothing; it only binds.
+                // A binding over the row cannot hoist: the template is built
+                // once, before any row exists.
+                if mentions_keyed(value, ctx) {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "vhtml: a `@let` inside a keyed `@for` body cannot read the row — \
+                         bind constants and locals here; reads belong in the expressions themselves",
+                    ));
+                }
                 bindings.push(quote! { let #name = (#value); });
             }
-            other => nodes.push(expand_node(other)),
+            other => nodes.push(expand_node(other, ctx)?),
         }
     }
 
@@ -730,11 +1495,11 @@ fn expand_children(children: &[MNode]) -> TokenStream2 {
         _ => quote! { #a::Node::fragment(::std::vec![ #(#nodes),* ]) },
     };
 
-    if bindings.is_empty() {
+    Ok(if bindings.is_empty() {
         body
     } else {
         quote! {{ #(#bindings)* #body }}
-    }
+    })
 }
 /// Expand a token stream into the shared AST.
 ///
@@ -748,9 +1513,153 @@ impl Parse for MNode {
     }
 }
 
+/// The whole `vhtml!` input: an optional schema header, then the node list.
+struct VhtmlInput {
+    schema: Schema,
+    nodes: Vec<MNode>,
+}
+
+impl Parse for VhtmlInput {
+    fn parse(input: ParseStream) -> Result<Self> {
+        // The header is only unambiguous when the first word starts something
+        // that *cannot* be a node: `schema { … }` would otherwise parse as an
+        // element named `schema` and choke on `count = 3` where an attribute
+        // list expects a value.
+        let schema = if input.peek(Ident::peek_any)
+            && input.peek2(syn::token::Brace)
+            && input.fork().call(Ident::parse_any)?.to_string() == "schema"
+        {
+            let schema = parse_schema(input);
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+            Some(schema?)
+        } else {
+            None
+        }
+        .unwrap_or(Schema {
+            names: Vec::new(),
+            present: false,
+        });
+
+        let nodes =
+            Punctuated::<MNode, Token![,]>::parse_terminated(input)?.into_iter().collect();
+        Ok(VhtmlInput { schema, nodes })
+    }
+}
+
+/// Read the header group: `schema { count = 3.0, hot }`.
+///
+/// Initial values are recorded and then unused — the schema is an id contract,
+/// not a runtime declaration. They are parsed anyway so a form like
+/// `count = signal("x")` fails here, where the meaning of the type would be
+/// guessable but its grammar wrong, rather than confusingly as code.
+fn parse_schema(input: ParseStream) -> Result<Schema> {
+    let id: Ident = input.call(Ident::parse_any)?;
+    let mut names: Vec<String> = Vec::new();
+    let mut errors: Vec<syn::Error> = Vec::new();
+
+    let inner;
+    syn::braced!(inner in input);
+    while !inner.is_empty() {
+        let name = inner.call::<Ident>(Ident::parse_any)?;
+        if names.contains(&name.to_string()) {
+            errors.push(syn::Error::new(
+                name.span(),
+                format!("vhtml: signal `{}` is declared twice in the schema", name),
+            ));
+        }
+        names.push(name.to_string());
+        if inner.peek(Token![=]) {
+            inner.parse::<Token![=]>()?;
+            let value: RustExpr = inner.parse()?;
+            match value {
+                RustExpr::Lit(_) => {}
+                other => errors.push(syn::Error::new_spanned(
+                    other,
+                    "vhtml: a schema initial value must be a literal (it is a contract, not a runtime)",
+                )),
+            }
+        }
+        if !inner.is_empty() {
+            inner.parse::<Token![,]>()?;
+        }
+    }
+
+    if names.is_empty() {
+        errors.push(syn::Error::new(
+            id.span(),
+            "vhtml: `schema { }` declares nothing — list the signals the island may name, or drop the header",
+        ));
+    }
+    if let Some(e) = errors.into_iter().reduce(|a, b| {
+        syn::Error::new(a.span(), format!("{}\n{}", a, b))
+    }) {
+        return Err(e);
+    }
+    Ok(Schema {
+        names,
+        present: true,
+    })
+}
+
+/// Every string-literal signal id the tree names, with where it was named.
+fn collect_signal_uses<'a>(nodes: &'a [MNode], out: &mut Vec<&'a LitStr>) {
+    for node in nodes {
+        match node {
+            MNode::Show { when, then, otherwise, .. } => {
+                if let ShowCond::Signal(lit) = when {
+                    out.push(lit);
+                }
+                collect_signal_uses(then, out);
+                collect_signal_uses(otherwise, out);
+            }
+            MNode::If { then, otherwise, .. } => {
+                collect_signal_uses(then, out);
+                collect_signal_uses(otherwise, out);
+            }
+            MNode::For { body, .. } => collect_signal_uses(body, out),
+            MNode::Element(el) => collect_signal_uses(&el.children, out),
+            _ => {}
+        }
+    }
+}
+
+/// The compile-time contract, only when a schema header was written.
+fn validate_schema(schema: &Schema, nodes: &[MNode]) -> Vec<syn::Error> {
+    if !schema.present {
+        return Vec::new();
+    }
+    let mut uses = Vec::new();
+    collect_signal_uses(nodes, &mut uses);
+    uses.iter()
+        .filter(|lit| !schema.names.contains(&lit.value()))
+        .map(|lit| {
+            syn::Error::new(
+                lit.span(),
+                format!(
+                    "vhtml: signal `{}` is not in the island schema — declare it in the `schema {{ … }}` header",
+                    lit.value()
+                ),
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn expand(input: TokenStream) -> TokenStream {
-    let nodes: Vec<MNode> = parse_macro_input!(input with Punctuated::<MNode, Token![,]>::parse_terminated)
-        .into_iter()
-        .collect();
-    TokenStream::from(expand_children(&nodes))
+    let body = parse_macro_input!(input as VhtmlInput);
+    let errors = validate_schema(&body.schema, &body.nodes);
+    if !errors.is_empty() {
+        // Report every rejected reference at once; the tree lowers to nothing.
+        return errors
+            .into_iter()
+            .map(|e| e.to_compile_error())
+            .collect::<TokenStream2>()
+            .into();
+    }
+
+    match expand_children(&body.nodes, &[]) {
+        Ok(tokens) => TokenStream::from(tokens),
+        Err(e) => e.to_compile_error().into(),
+    }
 }

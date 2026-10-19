@@ -68,7 +68,11 @@ A click rewrites one text node. No reload, no round trip.
 
 Maud is supported two ways: `vhtml!` takes Maud's syntax and lowers it to the
 AST, and `velo_ast::parse_html` reads real Maud output back into a tree — so an
-existing backend can migrate one panel at a time.
+existing backend can migrate one panel at a time. `vhtml!` loops update from
+signal writes; with a `key` (`@for t in rows.get(), key = t.id`) rows reconcile
+by identity, so a reorder moves DOM instead of rebuilding it. An island can
+declare its signal contract with a `schema { … }` header, checked at compile
+time — with no header, no checks apply.
 
 Run the client end to end in a real browser:
 

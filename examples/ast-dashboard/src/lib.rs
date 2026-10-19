@@ -462,6 +462,29 @@ fn vhtml_loop_tests(doc: &web_sys::Document) -> Vec<TestResult> {
         ),
     });
 
+    // 13b. The keyed island in the same loop tracks the same signal.
+    let keyed = |()| -> Vec<web_sys::Element> {
+        match doc.get_element_by_id("vhtml-keyed") {
+            Some(ul) => ul
+                .query_selector_all("li")
+                .map(|list| {
+                    (0..list.length())
+                        .filter_map(|i| list.item(i).and_then(|n| n.dyn_into().ok()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+    let keyed_after_add = keyed(());
+    results.push(match keyed_after_add.len() {
+        2 => TestResult::pass("keyed-for-tracks-the-same-signal"),
+        n => TestResult::fail(
+            "keyed-for-tracks-the-same-signal",
+            format!("{n} keyed rows after adding one, expected 2"),
+        ),
+    });
+
     // 14. A row's toggle is recomputed for the new row, not inherited.
     results.push(match after_add.last() {
         Some(li) => {
@@ -478,13 +501,30 @@ fn vhtml_loop_tests(doc: &web_sys::Document) -> Vec<TestResult> {
         None => TestResult::fail("vhtml-rows-recompute-their-own-toggles", "no row to check"),
     });
 
-    // 15. Emptying the list removes every row.
+    // 15. Keyed rows keep identity across reordering: after moving the first
+    //     row to the end, the data-ids follow the data, not the positions.
+    click(doc, "vhtml-shuffle");
+    let keyed_ids = keyed(())
+        .iter()
+        .filter_map(|li| li.get_attribute("data-id"))
+        .collect::<Vec<String>>();
+    let keyed_order: Vec<&str> = keyed_ids.iter().map(|id| id.as_str()).collect();
+    results.push(match keyed_order.as_slice() {
+        ["2", "1"] => TestResult::pass("keyed-for-reorders-doms-with-identity"),
+        order => TestResult::fail(
+            "keyed-for-reorders-doms-with-identity",
+            format!("key order after shuffle was {order:?}, expected [\"2\", \"1\"]"),
+        ),
+    });
+
+    // 16. Emptying the list removes every row.
     click(doc, "vhtml-clear");
-    results.push(match rows(()).len() {
-        0 => TestResult::pass("vhtml-for-renders-nothing-for-an-empty-list"),
-        n => TestResult::fail(
+    let cleared = (rows(()).len(), keyed(()).len());
+    results.push(match cleared {
+        (0, 0) => TestResult::pass("vhtml-for-renders-nothing-for-an-empty-list"),
+        (a, b) => TestResult::fail(
             "vhtml-for-renders-nothing-for-an-empty-list",
-            format!("{n} rows after clearing, expected 0"),
+            format!("after clearing: {a} plain rows, {b} keyed rows, expected 0 rows"),
         ),
     });
 
@@ -606,6 +646,22 @@ fn mount_vhtml_island(doc: &web_sys::Document) {
     // The list itself is a signal, so writing to it re-runs the loop.
     let threats = signal!(vec![Threat::new(1, "brute force", "high")]);
 
+    // The keyed island mirrors the same data through `Value` rows: keyed
+    // reconciliation reads fields from values, so the loop's source list has
+    // to be convertible — the price of the key, next to the row-grammar body.
+    let threats_to_rows = |rows: &[Threat]| -> Vec<veloasm::velo_ast::Value> {
+        rows.iter()
+            .map(|t| {
+                veloasm::velo_ast::Value::map([
+                    ("id", veloasm::velo_ast::Value::from(t.id as usize)),
+                    ("title", veloasm::velo_ast::Value::from(t.title.as_str())),
+                    ("severity", veloasm::velo_ast::Value::from(t.severity)),
+                ])
+            })
+            .collect()
+    };
+    let keyed_rows = signal!(threats_to_rows(&threats.get()));
+
     let root = vhtml! {
         section id="vhtml-list" {
             ul id="vhtml-rows" {
@@ -613,7 +669,13 @@ fn mount_vhtml_island(doc: &web_sys::Document) {
                     li class:critical=(t.severity == "high") { (t.title) }
                 }
             }
+            ul id="vhtml-keyed" {
+                @for t in keyed_rows.get(), key = t.id {
+                    li data-id=(format!("{}", t.id)) { (t.title) }
+                }
+            }
             button id="vhtml-add" { "add threat" }
+            button id="vhtml-shuffle" { "shuffle" }
             button id="vhtml-clear" { "clear" }
         }
     };
@@ -630,14 +692,32 @@ fn mount_vhtml_island(doc: &web_sys::Document) {
     }
 
     let threats_add = threats;
+    let threats_shuffle = threats;
     let threats_clear = threats;
+    let keyed_add = keyed_rows;
+    let keyed_shuffle = keyed_rows;
+    let keyed_clear = keyed_rows;
     on_click(doc, "vhtml-add", move || {
         let mut next = threats_add.get();
         next.push(Threat::new(next.len() as u32 + 1, "port scan", "low"));
         threats_add.set(next);
+        keyed_add.set(threats_to_rows(&threats_add.get()));
+    });
+    // Move the first row to the end: the one structural case keyed
+    // reconciliation exists for, and the one that hurts positionally keyed
+    // loops — every row but one changes index.
+    on_click(doc, "vhtml-shuffle", move || {
+        let mut next = threats_shuffle.get();
+        if !next.is_empty() {
+            let first = next.remove(0);
+            next.push(first);
+            threats_shuffle.set(next);
+            keyed_shuffle.set(threats_to_rows(&threats_shuffle.get()));
+        }
     });
     on_click(doc, "vhtml-clear", move || {
         threats_clear.set(Vec::new());
+        keyed_clear.set(Vec::new());
     });
 }
 

@@ -268,11 +268,21 @@ any assertion failed.
   client mounts the AST on top of it; it does not diff against it. That keeps
   the renderer small and total, at the cost of not saving the first-frame round
   trip. Hydration markers can be added later without changing the AST.
-- **`vhtml!` loops are reactive but not reconciling.** Writing the list's signal
-  re-runs the whole `@for` body, so rows appear and disappear correctly — this is
-  a `Node::Native` closure, and it is why the loop can keep Maud's plain-Rust
-  body. What it cannot do is *reuse* a row's DOM node: reuse requires comparing
-  row values, and a `vhtml!` row is an arbitrary Rust type rather than a
-  comparable `Value`. Rows are therefore rebuilt on every list update. A
-  serializable, keyed, reconciling loop is `Node::each`, from the builder API —
-  the right choice for a long list, and the only one that can ship.
+- **`vhtml!` unkeyed loops are reactive but not reconciling.** Writing the
+  list's signal re-runs the whole `@for` body, so rows appear and disappear
+  correctly — this is a `Node::Native` closure, and it is why the loop can keep
+  Maud's plain-Rust body. What it cannot do is *reuse* a row's DOM node: reuse
+  requires comparing row values, and an unkeyed `vhtml!` row is an arbitrary
+  Rust type rather than a comparable `Value`. Rows are therefore rebuilt on
+  every list update.
+- **`vhtml!` keyed loops reconcile.** `@for t in rows.get(), key = t.id` lowers
+  to the same `Node::each` the builder API produces, so moved rows are placed
+  rather than rebuilt. The price: rows are values (`Vec<Value>`-shaped
+  sources), splices in the body constrain to the row grammar (reads, `t.field`
+  / `t.get("f")`, literals, comparisons, arithmetic, boolean logic, ternaries,
+  and `format!` with plain placeholders), and an inner keyed loop iterates a
+  field read of the outer row (`@for r in t.children, key = r.code`).
+  Anything else fails the build with the shape spelled out. An island can
+  declare its signal contract with a `schema { … }` header, checked at
+  compile time against `@Show("id")` literal reads — absent the header, no
+  checks apply and nothing about existing behavior changes.
