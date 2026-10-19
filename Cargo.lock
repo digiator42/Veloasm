@@ -1851,6 +1851,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "velo_ast"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "velo_macro"
 version = "0.1.1"
 dependencies = [
@@ -1868,6 +1876,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "velo_ast",
  "velo_macro",
  "wasm-bindgen",
  "wasm-bindgen-futures",

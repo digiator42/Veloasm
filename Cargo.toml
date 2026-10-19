@@ -3,6 +3,7 @@ members = [
     "crates/velo",
     "crates/velo-cli",
     "crates/macro",
+    "crates/ast",
     "examples/counter-spa", "examples/server-monitor-dashboard",
     "examples/features-demo",
     "examples/todo-app",

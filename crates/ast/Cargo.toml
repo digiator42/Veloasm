@@ -1,0 +1,29 @@
+[package]
+name = "velo_ast"
+version = "0.1.0"
+edition = "2021"
+description = "The shared, serializable view AST for the Veloasm ecosystem: written once on a Rust backend (e.g. gritshield), rendered to HTML for SSR or hydrated into a fine-grained WASM client."
+license = "MIT"
+repository = "https://github.com/digiator42/Velo"
+keywords = ["wasm", "reactive", "ast", "html", "ssr"]
+categories = ["wasm", "web-programming"]
+
+# Hard rule for this crate: it must build for `wasm32-unknown-unknown` AND for a
+# native server (tokio/axum/sea-orm) with the same source. That means no default
+# dependencies at all — `serde` is opt-in so a pure-wasm consumer that only ever
+# builds views in-proc pays nothing for the wire format.
+[dependencies]
+serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+# Wire format + client-side deserialization. GritShield turns this on to ship
+# `View` as JSON; a pure `vhtml!`-compiled wasm app can leave it off.
+serde = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
