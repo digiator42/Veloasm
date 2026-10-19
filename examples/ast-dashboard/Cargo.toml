@@ -1,0 +1,29 @@
+[package]
+name = "ast-dashboard"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# One dependency is enough to author a view: the AST is reachable through
+# `veloasm::velo_ast`, so neither `vhtml!` nor the builders force an app to
+# declare `velo_ast` separately.
+veloasm = { path = "../../crates/velo", features = ["json"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Event",
+    "MouseEvent",
+    "NodeList",
+    "console",
+]

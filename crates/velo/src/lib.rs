@@ -14,7 +14,7 @@
 
 /// The `view!`, `#[component]`, `routes!`, and `#[route]` procedural macros
 /// (defined in the companion `velo_macro` package).
-pub use velo_macro::{app, component, error, layout, loading, not_found, page, route, routes, route_path, view};
+pub use velo_macro::{app, component, error, layout, loading, not_found, page, route, routes, route_path, view, vhtml};
 
 // =============================================================================
 // DX toolkit modules — timers, SSE, stream/scroll helpers
@@ -26,6 +26,17 @@ mod timers;
 
 pub use io::{scroll_to_bottom, stream_lines, LineSplitter};
 pub use timers::{debounced, interval, timeout, IntervalHandle, TimeoutHandle};
+
+/// The shared, serializable view AST — write a view once in Rust on a backend,
+/// ship it as JSON, mount it here with live fine-grained reactivity.
+///
+/// See [`ast`] for the renderer, and the `velo_ast` crate for the data model
+/// (which a native backend depends on directly, without pulling in WASM).
+pub mod ast;
+
+/// Re-exported so an app can name AST types without also depending on
+/// `velo_ast` itself.
+pub use velo_ast;
 
 // =============================================================================
 // =============================================================================
@@ -1392,6 +1403,17 @@ pub async fn fetch(url: &str) -> Result<VeloResponse, JsValue> {
 ///     veloasm::fetch_json::<User>("/api/users/1").await.unwrap()
 /// });
 /// ```
+///
+/// # It asks for JSON
+///
+/// The request carries `Accept: application/json`. A browser's `fetch` sends no
+/// `Accept` of its own — it defaults to `*/*` — and a server that content-
+/// negotiates (serving HTML to browsers and an AST to clients from one route)
+/// will read `*/*` as "no preference" and reply with HTML. Then this decodes a
+/// page as data and reports a confusing decode error.
+///
+/// Naming the type we intend to parse is not politeness, it is what makes
+/// content negotiation work between a page and the app that enhances it.
 #[cfg(feature = "json")]
 pub async fn fetch_json<T>(url: &str) -> Result<T, FetchError>
 where
@@ -1399,7 +1421,14 @@ where
 {
     let window = web_sys::window()
         .ok_or_else(|| FetchError::Network("No window for fetch".into()))?;
-    let promise = window.fetch_with_str(url);
+
+    let opts = web_sys::RequestInit::new();
+    opts.set_headers(&JsValue::from_serde(&serde_json::json!({
+        "accept": "application/json",
+    }))
+    .map_err(|e| FetchError::Network(format!("could not build the Accept header: {e}")))?);
+
+    let promise = window.fetch_with_str_and_init(url, &opts);
     let response = wasm_bindgen_futures::JsFuture::from(promise).await?;
     let response: web_sys::Response =
         wasm_bindgen::JsCast::dyn_into(response).map_err(|_| {
@@ -3521,8 +3550,8 @@ pub mod prelude {
     pub use crate::{fetch_json, post_json};
 
     // Re-export the view! + #[component] + routes! + #[route] + app!/#[page]
-    // procedural macros
-    pub use crate::{app, component, error, layout, loading, not_found, page, route, routes, route_path, view};
+    // procedural macros, plus vhtml! (Maud syntax -> the shared AST)
+    pub use crate::{app, component, error, layout, loading, not_found, page, route, routes, route_path, view, vhtml};
 
     // Re-export the shorthand convenience macros. `signal!` shares its name with
     // the `signal` value already re-exported above, so the macro rides along on

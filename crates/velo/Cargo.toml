@@ -12,6 +12,9 @@ categories = ["wasm", "web-programming"]
 # `version` is retained so publishing still works (the path is stripped on
 # `cargo publish`; the macro crate must be published first/in tandem).
 velo_macro = { version = "0.1.1", path = "../macro" }
+# The shared, serializable view AST. Lets a Rust backend build a view that this
+# client mounts with live reactivity — see `veloasm::ast`.
+velo_ast = { version = "0.1.0", path = "../ast" }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }
@@ -24,7 +27,11 @@ serde_json = { workspace = true, optional = true }
 # Typed `fetch_json::<T>(url)` / `response.json::<T>()` via serde JSON parsing.
 # Off by default to keep the WASM core small; enable it only when you need
 # typed payload decoding from the `veloasm::fetch` wrapper.
-json = ["serde", "serde_json", "wasm-bindgen/serde-serialize"]
+#
+# It also turns on `velo_ast/serde`, which the shared AST needs for its wire
+# format — a view shipped by a backend is JSON, so a client that consumes one
+# is already past the point where serde is optional.
+json = ["serde", "serde_json", "wasm-bindgen/serde-serialize", "velo_ast/serde"]
 
 [dependencies.web-sys]
 workspace = true

@@ -6,7 +6,7 @@ use veloasm::prelude::*;
 #[component]
 pub fn UserCard(name: RwSignal<String>, role: &'static str) -> DomNode {
     view! {
-        <div class:on="user-card">
+        <div class="user-card">
             <p>"Hello, " { name } "!"</p>
             <p class="role">"Role: " { role }</p>
         </div>

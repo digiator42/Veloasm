@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>veloasm — the shared AST, mounted</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #0b1020; color: #e2e8f0;
+               padding: 2rem; max-width: 52rem; }
+        h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 .25rem; }
+        p.lede { color: #94a3b8; margin: 0 0 1.5rem; font-size: .9rem; }
+        .panel { background: #111827; border: 1px solid #1f2937; border-radius: .75rem;
+                 padding: 1.25rem; }
+        .panel.is-on { border-color: #34d399; box-shadow: 0 0 0 1px #34d39933; }
+        .row { color: #cbd5e1; }
+        .row-label { color: #34d399; font-family: ui-monospace, monospace; }
+        #count-value, #flag-value, #draft-value, #seen-value {
+            font-family: ui-monospace, monospace; color: #fbbf24; }
+        button { background: #1d4ed8; color: white; border: none; padding: .4rem .8rem;
+                 border-radius: .375rem; cursor: pointer; font-size: .8rem; margin-right: .4rem; }
+        button:hover { background: #1e40af; }
+        #draft { background: #0b1020; color: #e2e8f0; border: 1px solid #1f2937;
+                 border-radius: .375rem; padding: .4rem .6rem; }
+        pre#test-results { background: #0b1020; border: 1px solid #1f2937; border-radius: .5rem;
+                           padding: 1rem; font-size: .8rem; line-height: 1.6; margin-top: 1.5rem;
+                           white-space: pre-wrap; }
+    </style>
+    <link rel="data-trunk" href="Cargo.toml" data-type="rust"/>
+    <!-- The view payload the client fetches, written by
+         `cargo run --example emit_view -- --emit-view`. Copied to the site
+         root so the client can fetch `/view.json`. -->
+    <link data-trunk rel="copy-file" href="public/view.json"/>
+</head>
+<body>
+    <h1>The shared AST, mounted</h1>
+    <p class="lede">
+        The view below was built once, in Rust, serialised to <code>view.json</code>,
+        and fetched by this page. The client mounted it and ran its own assertions
+        against the live DOM — the results appear at the bottom of this page.
+    </p>
+
+    <div id="app"></div>
+
+    <h1 style="margin-top:2rem">The Maud path: <code>vhtml!</code></h1>
+    <p class="lede">
+        Hand-written below in <code>vhtml!</code> — a signal holding a
+        <code>Vec&lt;Threat&gt;</code> and a <code>@for</code> over it, with the
+        class toggle computed in Rust. No AST types, and it updates from a
+        signal change without a re-render.
+    </p>
+    <div id="vhtml-panel"></div>
+
+    <pre id="test-results">waiting for the client…</pre>
+</body>
+</html>

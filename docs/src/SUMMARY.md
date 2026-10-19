@@ -27,6 +27,9 @@
 - [Conditional Rendering & Control Flow](view-macro/control-flow.md)
 - [Keyed Reactive Lists](view-macro/keyed-lists.md)
 
+# The Shared AST (Server-Authored Views)
+- [Shared AST Overview](shared-ast/overview.md)
+
 # Components & Composition
 - [Defining Components with `#[component]`](components/defining-components.md)
 - [Component Props & Reactivity](components/props.md)

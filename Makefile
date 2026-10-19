@@ -10,7 +10,7 @@
 
 BUDGET_KB ?= 60
 
-.PHONY: all check test build docs size fmt-check lint
+.PHONY: all check test build docs size fmt-check lint browser-test
 
 all: check
 
@@ -33,6 +33,12 @@ build:
 ## Build the mdBook docs
 docs:
 	mdbook build docs
+
+## Drive the shared-AST client in a real browser and assert on the results
+## (the page runs its own assertions against the live DOM; this reads them back)
+browser-test:
+	pwsh -NoProfile -File scripts/browser-test.ps1
+
 
 ## Assert the counter-spa gzipped wasm stays under the size budget
 size:

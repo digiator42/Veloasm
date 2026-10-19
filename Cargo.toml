@@ -18,6 +18,7 @@ members = [
     "examples/new-features",
     "examples/prefetch-fetch",
     "examples/velocity",
+    "examples/ast-dashboard",
 ]
 resolver = "2"
 

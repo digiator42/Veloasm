@@ -8,6 +8,34 @@ use syn::parse::{Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::{parse_macro_input, Expr, Ident, LitStr, Pat, Token};
 
+/// `vhtml!` — Maud's syntax, compiled to the shared `velo_ast` view tree.
+///
+/// Lives in its own module because it is a self-contained front end; re-exported
+/// here so the proc macro sits at the crate root.
+mod vhtml;
+
+/// `vhtml! { … }` — Maud's template syntax, lowered to the shared `velo_ast`
+/// view tree instead of to HTML text.
+///
+/// The implementation lives in [`vhtml`]; the entry point must be here, because
+/// rustc requires a `#[proc_macro]` function to sit at the crate root.
+///
+/// ```ignore
+/// use velo_ast::View;
+///
+/// let root = vhtml! {
+///     div class="card" {
+///         h2 { "Threats" }
+///         @for t in threats { li { t.get("title") } }
+///     }
+/// };
+/// let view = View::new("card", root);
+/// ```
+#[proc_macro]
+pub fn vhtml(input: TokenStream) -> TokenStream {
+    vhtml::expand(input)
+}
+
 // --- JS-style arrow-closure sugar: `(pat, ..) => expr` / `(pat, ..) => { .. }` ---
 // Supports both sync `() => expr` and async `async () => { ... }` forms.
 // The `async` keyword gives the Next.js-style async feel for event handlers
