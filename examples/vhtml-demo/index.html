@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>vhtml! Macro Demo</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #121214;
+            color: #e1e1e6;
+            margin: 0;
+            padding: 2rem;
+        }
+        .demo { max-width: 900px; margin: 0 auto; }
+        h1 { color: #f4f4f5; border-bottom: 1px solid #4ade80; padding-bottom: 0.5rem; }
+        h2 { color: #a1a1aa; font-size: 1.2rem; margin-top: 2rem; }
+        h3 { color: #60a5fa; font-size: 1rem; margin-top: 1.5rem; }
+        section { border-top: 1px solid #29292e; padding-top: 1rem; margin-top: 1rem; }
+        code {
+            background: #1e1e21;
+            color: #f0f0f5;
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-family: 'Fira Code', 'JetBrains Mono', monospace;
+        }
+        pre {
+            background: #1e1e21;
+            border: 1px solid #29292e;
+            border-radius: 8px;
+            padding: 1rem;
+            overflow-x: auto;
+        }
+        .feature-card {
+            background: #202024;
+            border: 1px solid #29292e;
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 0.5rem 0;
+        }
+        .tag {
+            background: #60a5fa;
+            color: #121214;
+            padding: 0.1rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            margin-right: 0.5rem;
+        }
+        button {
+            background: #007acc;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            margin: 0.25rem;
+        }
+        button:hover { background: #005999; }
+        .test-result { font-family: monospace; font-size: 0.9rem; }
+        .pass { color: #4ade80; }
+        .fail { color: #f87171; }
+        .syntax-box {
+            background: #18181b;
+            border: 1px solid #29292e;
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 1rem 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="demo">
+        <h1>vhtml! Macro Demo</h1>
+        <p>
+            Maud-like syntax compiled to <code>velo_ast</code> nodes. Every syntax
+            sugar from commits <code>9e8b176</code> (vhtml macro) and
+            <code>ec916e1</code> (schema + keyed <code>@for</code>) is shown here.
+        </p>
+
+        <div class="feature-card">
+            <h3>Live demo</h3>
+            <p>
+                The <code>#[wasm_bindgen(start)]</code> entry point mounts
+                <code>all_features_view()</code> into <code>&lt;body&gt;</code>.
+                Click the increment / toggle buttons — the DOM updates
+                surgically (fine-grained reactivity), no page reload.
+            </p>
+            <p>
+                Build &amp; serve with Trunk:
+            </p>
+            <pre><code>trunk serve --dir examples/vhtml-demo</code></pre>
+            <p>Then open <code>http://localhost:8080</code>.</p>
+        </div>
+
+        <div id="test-results" class="test-result"></div>
+    </div>
+
+    <link data-trunk rel="rust" href="Cargo.toml" />
+</body>
+</html>

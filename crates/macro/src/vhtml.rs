@@ -133,12 +133,14 @@
 //! to try — ship it via a matching `velo_ast` tree when that matters.)
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{TokenStream as TokenStream2, Spacing, TokenTree};
 use quote::quote;
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream, Result};
+use syn::parse::discouraged::Speculative;
 use syn::punctuated::Punctuated;
 use syn::{parse_macro_input, Expr as RustExpr, Ident, LitStr, Pat, Token};
+use syn::token::Paren;
 
 /// Two-argument result alias for the lowering code, which reports via row
 /// grammar errors; `Result` stays syn's one-argument alias for the parser.
@@ -169,18 +171,29 @@ enum AttrValueSrc {
     Lit(LitStr),
     /// `(expr)` — rendered into a reactive expression.
     Splice(RustExpr),
+    /// `{{ expr }}` — a raw `velo_ast::Expr` used directly.
+    RawExpr(RustExpr),
     /// `.cls` — Maud's class shorthand, a statically-on toggle.
     ClassLit(String),
     /// `class:cls=(expr)` — a conditional class toggle.
-    ClassCond { cls: String, expr: RustExpr },
+    ClassCond { cls: String, expr: RustExpr, is_raw: bool },
+    /// `${ expr }` — a raw `velo_ast::Expr` used directly (JS template-literal style).
+    DollarExpr(RustExpr),
 }
 
 /// A parsed node.
 enum MNode {
     /// `"text"`
     Text(LitStr),
-    /// `(expr)`, or a bare expression, in text position.
+    /// `(expr)`, or a bare expression, in text position — lowered through
+    /// `emit_render` (wrapped in `Expr::render`).
     Splice(RustExpr),
+    /// `{{ expr }}` — a raw `velo_ast::Expr` used directly, not wrapped.
+    /// Needed to read AST signals by id in text position (`{{ Expr::signal("count") }}`).
+    RawExpr(RustExpr),
+    /// `${ expr }` — a raw `velo_ast::Expr` used directly (JS template-literal style).
+    /// An alternative to `{{ }}` that reads better for developers coming from JS.
+    DollarExpr(RustExpr),
     /// `@let name = expr;`
     Let {
         /// The bound name.
@@ -359,6 +372,25 @@ impl Parse for MAttr {
                         value: Some(AttrValueSrc::ClassCond {
                             cls: second,
                             expr,
+                            is_raw: false,
+                        }),
+                        event: None,
+                    }),
+                    AttrValueSrc::RawExpr(expr) => Ok(MAttr {
+                        name: String::new(),
+                        value: Some(AttrValueSrc::ClassCond {
+                            cls: second,
+                            expr,
+                            is_raw: true,
+                        }),
+                        event: None,
+                    }),
+                    AttrValueSrc::DollarExpr(expr) => Ok(MAttr {
+                        name: String::new(),
+                        value: Some(AttrValueSrc::ClassCond {
+                            cls: second,
+                            expr,
+                            is_raw: true,
                         }),
                         event: None,
                     }),
@@ -395,11 +427,45 @@ impl Parse for MAttr {
     }
 }
 
-/// `= "literal"` or `= (expr)`.
+/// `= "literal"` or `= (expr)` or `= {{ expr }}` or `= ${ expr }` or `= |flag|` (raw Expr).
 fn parse_attr_rhs(input: ParseStream) -> Result<AttrValueSrc> {
+    // `${ expr }` — raw Expr (JS template-literal style).
+    {
+        let fork = input.fork();
+        if let Ok(TokenTree::Punct(p)) = fork.parse::<TokenTree>() {
+            if p.as_char() == '$'
+                && p.spacing() == Spacing::Alone
+                && fork.peek(syn::token::Brace)
+            {
+                input.advance_to(&fork);
+                let content;
+                syn::braced!(content in input);
+                let expr: RustExpr = content.parse()?;
+                return Ok(AttrValueSrc::DollarExpr(expr));
+            }
+        }
+    }
+    // `|flag|` — pipe-sugar for a signal id (cleaner than quoted string).
+    if input.peek(Token![|]) {
+        input.parse::<Token![|]>()?;
+        let ident: Ident = input.parse()?;
+        input.parse::<Token![|]>()?;
+        let lit = LitStr::new(&ident.to_string(), ident.span());
+        return Ok(AttrValueSrc::DollarExpr(
+            syn::parse_quote!(::veloasm::velo_ast::Expr::signal(#lit))
+        ));
+    }
     if input.peek(syn::token::Brace) {
         let content;
         syn::braced!(content in input);
+        // `{{ expr }}` — outer braces consumed, inner content starts with `{`.
+        if content.peek(syn::token::Brace) {
+            let inner;
+            syn::braced!(inner in content);
+            let expr: RustExpr = inner.parse()?;
+            return Ok(AttrValueSrc::RawExpr(expr));
+        }
+        // A lone `{ ... }` in attribute position.
         return Ok(AttrValueSrc::Splice(content.parse()?));
     }
     if input.peek(LitStr) {
@@ -413,7 +479,7 @@ fn parse_attr_rhs(input: ParseStream) -> Result<AttrValueSrc> {
 /// Parse children until the matching `}`.
 fn parse_children(input: ParseStream) -> Result<Vec<MNode>> {
     let mut out = Vec::new();
-    while !input.is_empty() && !input.peek(syn::token::Brace) {
+    while !input.is_empty() {
         out.push(parse_node(input)?);
     }
     Ok(out)
@@ -440,7 +506,7 @@ fn parse_node(input: ParseStream) -> Result<MNode> {
             "Show" => {
                 let when = parse_show_cond(input)?;
                 let then = parse_block(input)?;
-                let (otherwise, has_else) = parse_else(input)?;
+                let (otherwise, has_else) = parse_else(input, true)?;
                 Ok(MNode::Show {
                     when,
                     then,
@@ -455,6 +521,43 @@ fn parse_node(input: ParseStream) -> Result<MNode> {
                 ),
             )),
         };
+    }
+
+    // `${ expr }` — a raw `velo_ast::Expr` used directly (JS template-literal style).
+    {
+        let fork = input.fork();
+        if let Ok(TokenTree::Punct(p)) = fork.parse::<TokenTree>() {
+            if p.as_char() == '$'
+                && p.spacing() == Spacing::Alone
+                && fork.peek(syn::token::Brace)
+            {
+                input.advance_to(&fork);
+                let content;
+                syn::braced!(content in input);
+                let expr: RustExpr = content.parse()?;
+                return Ok(MNode::DollarExpr(expr));
+            }
+        }
+    }
+
+    // `{{ expr }}` — a raw `velo_ast::Expr` used directly (not wrapped in
+    // `Expr::render`). Needed to read AST signals by id in text position.
+    if input.peek(syn::token::Brace) {
+        let content;
+        syn::braced!(content in input);
+        // `{{ expr }}` — outer braces consumed, inner content starts with `{`.
+        if content.peek(syn::token::Brace) {
+            let inner;
+            syn::braced!(inner in content);
+            let expr: RustExpr = inner.parse()?;
+            return Ok(MNode::RawExpr(expr));
+        }
+        // A lone `{ ... }` in text position isn't valid vhtml! syntax.
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "vhtml: unexpected `{ ... }` in text position; use `(expr)` for \
+             reactive text or `{{ expr }}` for a raw velo_ast::Expr",
+        ));
     }
 
     // `(expr)` splice in text position.
@@ -564,13 +667,41 @@ fn parse_let(input: ParseStream) -> Result<MNode> {
     Ok(MNode::Let { name, value: Box::new(value) })
 }
 
+/// `@Show(cond)` — reactive conditional. `cond` is either a signal id string
+/// (`@Show("active")`, portable across the wire) or any Rust expression
+/// (`@Show(count.get() > 0)`, reactive in-browser only). Parentheses are
+/// optional for a bare signal id: `@Show active` is sugar for `@Show("active")`.
 fn parse_show_cond(input: ParseStream) -> Result<ShowCond> {
-    let content;
-    syn::parenthesized!(content in input);
-    if content.peek(LitStr) {
-        return Ok(ShowCond::Signal(content.parse::<LitStr>()?));
+    // `@Show("active")` — portable signal id.
+    if input.peek(LitStr) {
+        return Ok(ShowCond::Signal(input.parse::<LitStr>()?));
     }
-    Ok(ShowCond::Rust(content.parse()?))
+    // `@Show(count.get() > 0)` — reactive Rust expression.
+    // `@Show(flag)` — bare identifier inside parens, sugar for a signal id.
+    if input.peek(Paren) {
+        let content;
+        syn::parenthesized!(content in input);
+        if content.peek(LitStr) {
+            return Ok(ShowCond::Signal(content.parse::<LitStr>()?));
+        }
+        // `|flag|` pipe-sugar inside parens
+        if content.peek(Token![|]) {
+            content.parse::<Token![|]>()?;
+            let ident: Ident = content.parse()?;
+            content.parse::<Token![|]>()?;
+            return Ok(ShowCond::Signal(LitStr::new(&ident.to_string(), ident.span())));
+        }
+        // Single identifier inside parens: `@Show(flag)` → signal id
+        let fork = content.fork();
+        if fork.parse::<Ident>().is_ok() && fork.is_empty() {
+            let ident: Ident = content.parse()?;
+            return Ok(ShowCond::Signal(LitStr::new(&ident.to_string(), ident.span())));
+        }
+        return Ok(ShowCond::Rust(content.parse()?));
+    }
+    // `@Show active` — bare identifier, sugar for a signal id.
+    let ident = input.call(Ident::parse_any)?;
+    Ok(ShowCond::Signal(LitStr::new(&ident.to_string(), ident.span())))
 }
 
 fn parse_block(input: ParseStream) -> Result<Vec<MNode>> {
@@ -580,7 +711,11 @@ fn parse_block(input: ParseStream) -> Result<Vec<MNode>> {
 }
 
 /// `@else if … { }` chains, or a final `@else { }`.
-fn parse_else(input: ParseStream) -> Result<(Vec<MNode>, bool)> {
+///
+/// `reactive` controls whether an `@else if` link stays a reactive `@Show`
+/// (true) or degrades to build-time `@if` (false). Chained conditionals keep
+/// the same kind as their head, so `@Show(x) @else if (y) @else` is all-show.
+fn parse_else(input: ParseStream, reactive: bool) -> Result<(Vec<MNode>, bool)> {
     // `else` is a keyword, so it must be peeked as a token rather than as an
     // identifier.
     if !(input.peek(Token![@]) && input.peek2(Token![else])) {
@@ -589,9 +724,12 @@ fn parse_else(input: ParseStream) -> Result<(Vec<MNode>, bool)> {
     input.parse::<Token![@]>()?;
     input.parse::<Token![else]>()?;
 
-    // `else if` — re-enter the `@if` parser with the keyword already consumed.
+    // `else if` — re-enter the conditional parser with the keyword consumed.
     if input.peek(Token![if]) {
         input.parse::<Token![if]>()?;
+        if reactive {
+            return parse_show_if(input).map(|node| (vec![node], true));
+        }
         return parse_if(input).map(|node| (vec![node], true));
     }
 
@@ -599,11 +737,27 @@ fn parse_else(input: ParseStream) -> Result<(Vec<MNode>, bool)> {
     Ok((block, true))
 }
 
-/// Parsed with the `if` keyword already consumed.
+/// `@Show(cond) { … }` parsed with `@else if` already consumed. Mirrors
+/// `parse_if` but produces `MNode::Show` so an `@else if` chain stays
+/// reactive end to end.
+fn parse_show_if(input: ParseStream) -> Result<MNode> {
+    let when = parse_show_cond(input)?;
+    let then = parse_block(input)?;
+    let (otherwise, has_else) = parse_else(input, true)?;
+    Ok(MNode::Show {
+        when,
+        then,
+        otherwise,
+        has_else,
+    })
+}
+
+/// Parsed with the `if` keyword already consumed. Build-time `@if`: the
+/// condition is a plain Rust expression; `@else if` links stay `@if`.
 fn parse_if(input: ParseStream) -> Result<MNode> {
     let test: RustExpr = input.parse()?;
     let then = parse_block(input)?;
-    let (otherwise, has_else) = parse_else(input)?;
+    let (otherwise, has_else) = parse_else(input, false)?;
     Ok(MNode::If {
         test,
         then,
@@ -1187,9 +1341,14 @@ fn expand_attr(attr: &MAttr, ctx: &[Frame]) -> Res<TokenStream2> {
         }
         // `class:critical=(cond)` — same toggle, with the condition computed
         // in Rust rather than baked on.
-        (_, Some(AttrValueSrc::ClassCond { cls, expr })) => {
+        (_, Some(AttrValueSrc::ClassCond { cls, expr, is_raw })) => {
             let cls = cls.as_str();
-            let test = lower_splice(expr, ctx, emit_test)?;
+            let test = if *is_raw {
+                // Raw Expr used directly as the test expression.
+                quote! { #expr }
+            } else {
+                lower_splice(expr, ctx, emit_test)?
+            };
             Ok(quote! { #a::Attr::class_toggle(#cls, #test) })
         }
         // An event binding becomes an EventBinding, not an attribute.
@@ -1205,6 +1364,20 @@ fn expand_attr(attr: &MAttr, ctx: &[Frame]) -> Res<TokenStream2> {
             let name = name.as_str();
             let text = lit.value();
             Ok(quote! { #a::Attr::stat(#name, #text) })
+        }
+        (name, Some(AttrValueSrc::RawExpr(expr))) => {
+            // A raw `velo_ast::Expr` used directly as the attribute value.
+            let name = name.as_str();
+            Ok(quote! { #a::Attr::bound(#name, #expr) })
+        }
+        (_, Some(AttrValueSrc::DollarExpr(expr))) if attr.event.is_some() => {
+            let event = attr.event.as_ref().unwrap();
+            Ok(quote! { #a::EventBinding::new(#event, (#expr)) })
+        }
+        (name, Some(AttrValueSrc::DollarExpr(expr))) => {
+            // A raw `velo_ast::Expr` used directly as the attribute value.
+            let name = name.as_str();
+            Ok(quote! { #a::Attr::bound(#name, #expr) })
         }
         (name, Some(AttrValueSrc::Splice(expr))) => {
             let rendered = lower_splice(expr, ctx, emit_render)?;
@@ -1222,6 +1395,9 @@ fn expand_attr(attr: &MAttr, ctx: &[Frame]) -> Res<TokenStream2> {
 /// never mention the row keep the plain-Rust path they have outside loops.
 /// `emit` is that plain-Rust lowering: `emit_render` for text positions,
 /// `emit_test` for conditions.
+///
+/// Always returns an [`Expr`] token stream — either an interpreted row `Expr`
+/// (keyed context) or the plain-Rust `emit` result.
 fn lower_splice(
     expr: &RustExpr,
     ctx: &[Frame],
@@ -1299,7 +1475,15 @@ fn expand_node(node: &MNode, ctx: &[Frame]) -> Res<TokenStream2> {
 
         MNode::Splice(expr) => {
             let rendered = lower_splice(expr, ctx, emit_render)?;
-            Ok(quote! { #a::Node::text(#rendered) })
+            Ok(quote! { #a::Node::text_expr(#rendered) })
+        }
+
+        MNode::RawExpr(expr) => {
+            Ok(quote! { #a::Node::text_expr(#expr) })
+        }
+
+        MNode::DollarExpr(expr) => {
+            Ok(quote! { #a::Node::text_expr(#expr) })
         }
 
         MNode::If {
@@ -1331,8 +1515,8 @@ fn expand_node(node: &MNode, ctx: &[Frame]) -> Res<TokenStream2> {
                 // A string literal is a signal id: portable, and the only form
                 // that can ship to a browser as JSON.
                 ShowCond::Signal(lit) => {
-                    let id = lit.value();
-                    quote! { #a::Expr::signal(#id) }
+                    let s = proc_macro2::Literal::string(&lit.value());
+                    quote! { #a::Expr::signal(#s) }
                 }
                 ShowCond::Rust(expr) => lower_splice(expr, ctx, emit_test)?,
             };
@@ -1420,6 +1604,15 @@ fn expand_node(node: &MNode, ctx: &[Frame]) -> Res<TokenStream2> {
 
         MNode::Element(el) => {
             let tag = el.tag.as_str();
+
+            // Built-in reactive control-flow: `<Show when=… fallback=…>…</Show>`
+            // and `<Suspense loading=… fallback=…>…</Suspense>` (inverted predicate).
+            // Lowered directly to [`Node::show`](velo_ast::Node::show) so they
+            // render reactively instead of as opaque component nodes.
+            if tag == "Show" || tag == "Suspense" {
+                return expand_show(el, ctx, tag == "Suspense");
+            }
+
             let mut attrs = Vec::new();
             let mut events = Vec::new();
             for attr in &el.attrs {
@@ -1456,6 +1649,99 @@ fn expand_node(node: &MNode, ctx: &[Frame]) -> Res<TokenStream2> {
             }
         }
     }
+}
+
+/// `<Show when=… fallback=…>…</Show>` — reactive conditional, lowered to
+/// [`Node::show`](velo_ast::Node::show). `<Suspense loading=…>` inverts the
+/// predicate so content shows once loading is done.
+fn expand_show(el: &MElement, ctx: &[Frame], is_suspense: bool) -> Res<TokenStream2> {
+    let a = ast();
+    let mut when: Option<TokenStream2> = None;
+    let mut fallback: Option<TokenStream2> = None;
+
+    for attr in &el.attrs {
+        match attr.name.as_str() {
+            "when" | "loading" => {
+                let tokens = match &attr.value {
+                    Some(AttrValueSrc::Lit(lit)) => {
+                        let id = lit.value();
+                        quote! { #a::Expr::signal(#id) }
+                    }
+                    Some(AttrValueSrc::Splice(expr)) => {
+                        lower_splice(expr, ctx, emit_test)?
+                    }
+                    Some(AttrValueSrc::RawExpr(expr)) => {
+                        quote! { #expr }
+                    }
+                    Some(AttrValueSrc::DollarExpr(expr)) => {
+                        quote! { #expr }
+                    }
+                    _other => {
+                        return Err(syn::Error::new_spanned(
+                            &attr.name,
+                            "Show `when` needs a signal id (`when=\"active\"`), an \
+                             expression (`when={ cond }`), or a raw Expr \
+                             (`when=${ Expr::signal(\"active\") }`)",
+                        ))
+                    }
+                };
+                when = Some(tokens);
+            }
+            "fallback" => {
+                let tokens = match &attr.value {
+                    Some(AttrValueSrc::Lit(lit)) => {
+                        let text = lit.value();
+                        quote! { #a::Node::text(#text) }
+                    }
+                    Some(AttrValueSrc::Splice(expr)) => {
+                        quote! { #expr }
+                    }
+                    Some(AttrValueSrc::RawExpr(expr)) => {
+                        quote! { #expr }
+                    }
+                    Some(AttrValueSrc::DollarExpr(expr)) => {
+                        quote! { #expr }
+                    }
+                    _other => {
+                        return Err(syn::Error::new_spanned(
+                            &attr.name,
+                            "Show `fallback` needs a static string \
+                             (`fallback=\"No\"`), an expression \
+                             (`fallback={ Node::text(\"No\") }`), or a raw Expr \
+                             (`fallback=${ Node::text(\"No\") }`)",
+                        ))
+                    }
+                };
+                fallback = Some(tokens);
+            }
+            other => {
+                return Err(syn::Error::new_spanned(
+                    &attr.name,
+                    format!(
+                        "unknown attribute `{other}` on `<Show>` — only `when`/`loading` \
+                         and `fallback` are allowed"
+                    ),
+                ))
+            }
+        }
+    }
+
+    let when = when.ok_or_else(|| {
+        syn::Error::new_spanned(&el.tag, "`<Show>` requires a `when` attribute")
+    })?;
+    let fallback = fallback.unwrap_or_else(|| quote! { #a::Node::text("") });
+    let children = expand_children(&el.children, ctx)?;
+
+    // Suspense inverts: content shows when loading is false.
+    let predicate = if is_suspense {
+        quote! { #a::Expr::Not(::std::boxed::Box::new(#when)) }
+    } else {
+        when
+    };
+
+    Ok(quote! {
+        #a::Node::show(#predicate, #children, #fallback)
+    })
 }
 
 /// Children become a single node, or a fragment when there are siblings.
