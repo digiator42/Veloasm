@@ -4,6 +4,7 @@ members = [
     "crates/velo-cli",
     "crates/macro",
     "crates/ast",
+    "crates/ast_macro",
     "examples/counter-spa", "examples/server-monitor-dashboard",
     "examples/features-demo",
     "examples/todo-app",

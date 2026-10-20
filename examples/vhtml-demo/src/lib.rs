@@ -321,4 +321,26 @@ mod tests {
             @Show("count") { p { "declared" } }
         };
     }
+
+    #[test]
+    fn velo_ast_macro_builds_portable_view() {
+        // Backend path: `velo_ast_macro::vhtml` builds a View with no WASM deps.
+        // The resulting View is portable and serializable to JSON.
+        let view: View = View::new(
+            "backend-panel",
+            velo_ast_macro::vhtml! {
+                schema { flag, count },
+                div class="panel" {
+                    h2 { "Backend Panel" }
+                    @Show(flag) { p { "flag is on" } } @else { p { "flag is off" } }
+                    p { "count: " ${ Expr::signal("count") } }
+                }
+            },
+        );
+        assert!(view.is_portable());
+        let json = view.to_json().expect("view serializes to JSON");
+        assert!(json.contains("panel"));
+        assert!(json.contains("flag"));
+        assert!(json.contains("count"));
+    }
 }

@@ -8,4 +8,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 veloasm = { path = "../../crates/velo" }
+velo_ast = { path = "../../crates/ast", features = ["serde"] }
+velo_ast_macro = { path = "../../crates/ast_macro" }
 wasm-bindgen = "0.2"
