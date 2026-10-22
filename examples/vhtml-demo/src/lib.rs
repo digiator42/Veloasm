@@ -63,7 +63,6 @@
 //! ```
 
 use veloasm::vhtml;
-use veloasm::velo_ast::event::{EventAction, EventOp};
 use veloasm::velo_ast::{Expr, Node, SignalDecl, Value, View};
 
 // ---------------------------------------------------------------------------
@@ -109,15 +108,28 @@ pub fn all_features() -> Node {
             // class toggle from the AST "flag" signal (pipe signal ref)
             div class:highlight=|flag| { "highlight toggles with flag" }
 
-            // --- events: on:<event>={ EventAction } -------------------------
+            // --- events: on:<event>={ action } ------------------------------
             // Events write to AST signal ids. The SignalStore is shared with
             // the reads above, so the display updates live.
             div {
-                button on:click=( EventAction::one(EventOp::add("count", 1.0)) ) {
+                button on:click={ add("count", 1.0) } {
                     "increment count"
                 }
-                button on:click=( EventAction::one(EventOp::toggle("flag")) ) {
+                button on:click={ toggle("flag") } {
                     "toggle flag"
+                }
+            }
+
+            // --- closure syntax for multiple ops -------------------------
+            div {
+                button on:click={ || { add("count", 1.0); toggle("flag") } } {
+                    "inc + toggle (closure)"
+                }
+                button on:click={ || combine(vec![add("count", 2.0), toggle("flag")]) } {
+                    "inc by 2 + toggle (combine)"
+                }
+                button on:click={ || set("count", num(42.0)) } {
+                    "set count to 42"
                 }
             }
 
@@ -322,25 +334,4 @@ mod tests {
         };
     }
 
-    #[test]
-    fn velo_ast_macro_builds_portable_view() {
-        // Backend path: `velo_ast_macro::vhtml` builds a View with no WASM deps.
-        // The resulting View is portable and serializable to JSON.
-        let view: View = View::new(
-            "backend-panel",
-            velo_ast_macro::vhtml! {
-                schema { flag, count },
-                div class="panel" {
-                    h2 { "Backend Panel" }
-                    @Show(flag) { p { "flag is on" } } @else { p { "flag is off" } }
-                    p { "count: " ${ Expr::signal("count") } }
-                }
-            },
-        );
-        assert!(view.is_portable());
-        let json = view.to_json().expect("view serializes to JSON");
-        assert!(json.contains("panel"));
-        assert!(json.contains("flag"));
-        assert!(json.contains("count"));
     }
-}

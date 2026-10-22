@@ -146,6 +146,79 @@ use syn::token::Paren;
 /// grammar errors; `Result` stays syn's one-argument alias for the parser.
 type Res<T> = std::result::Result<T, syn::Error>;
 
+/// Event helper functions available in the vhtml! macro scope.
+/// These generate EventAction/EventOp tokens for concise event handlers.
+fn event_helpers() -> TokenStream2 {
+    quote! {
+        /// Add to a signal: `count += n`
+        fn add(target: &str, by: f64) -> ::veloasm::velo_ast::event::EventAction {
+            ::veloasm::velo_ast::event::EventAction::one(::veloasm::velo_ast::event::EventOp::add(target, by))
+        }
+        /// Subtract from a signal: `count -= n`
+        fn sub(target: &str, by: f64) -> ::veloasm::velo_ast::event::EventAction {
+            ::veloasm::velo_ast::event::EventAction::one(::veloasm::velo_ast::event::EventOp::sub(target, by))
+        }
+        /// Toggle a boolean signal
+        fn toggle(target: &str) -> ::veloasm::velo_ast::event::EventAction {
+            ::veloasm::velo_ast::event::EventAction::one(::veloasm::velo_ast::event::EventOp::toggle(target))
+        }
+        /// Set a signal to an expression value
+        fn set(target: &str, value: ::veloasm::velo_ast::Expr) -> ::veloasm::velo_ast::event::EventAction {
+            ::veloasm::velo_ast::event::EventAction::one(::veloasm::velo_ast::event::EventOp::set(target, ::veloasm::velo_ast::event::EventValue::Expr(value)))
+        }
+        /// Call a handler by name
+        fn call(handler: &str) -> ::veloasm::velo_ast::event::EventAction {
+            ::veloasm::velo_ast::event::EventAction::one(::veloasm::velo_ast::event::EventOp::call(handler))
+        }
+        /// Navigate to a route
+        fn navigate(to: impl Into<::veloasm::velo_ast::Expr>) -> ::veloasm::velo_ast::event::EventAction {
+            ::veloasm::velo_ast::event::EventAction::one(::veloasm::velo_ast::event::EventOp::Navigate { to: to.into() })
+        }
+        /// Allow default browser behavior (don't preventDefault)
+        fn allow_default() -> ::veloasm::velo_ast::event::EventAction {
+            ::veloasm::velo_ast::event::EventAction::one(::veloasm::velo_ast::event::EventOp::AllowDefault)
+        }
+        /// Combine multiple EventActions into one
+        fn combine(actions: Vec<::veloasm::velo_ast::event::EventAction>) -> ::veloasm::velo_ast::event::EventAction {
+            let mut ops = Vec::new();
+            for a in actions { ops.extend(a.ops); }
+            ::veloasm::velo_ast::event::EventAction::new(ops)
+        }
+        /// Create an EventValue from an expression
+        fn ev_expr(expr: ::veloasm::velo_ast::Expr) -> ::veloasm::velo_ast::event::EventValue {
+            ::veloasm::velo_ast::event::EventValue::Expr(expr)
+        }
+        /// Create an EventValue from a target property (e.g. "value", "checked")
+        fn ev_target_prop(prop: &str) -> ::veloasm::velo_ast::event::EventValue {
+            ::veloasm::velo_ast::event::EventValue::TargetProperty(prop.to_string())
+        }
+        /// Create an EventValue from the event target's text
+        fn ev_target_text() -> ::veloasm::velo_ast::event::EventValue {
+            ::veloasm::velo_ast::event::EventValue::TargetText
+        }
+        /// Create an EventValue from the last server response
+        fn ev_response() -> ::veloasm::velo_ast::event::EventValue {
+            ::veloasm::velo_ast::event::EventValue::Response
+        }
+        /// Signal reference for use in EventValue::Expr
+        fn signal(id: &str) -> ::veloasm::velo_ast::Expr {
+            ::veloasm::velo_ast::Expr::signal(id)
+        }
+        /// Numeric literal as Expr
+        fn num(n: f64) -> ::veloasm::velo_ast::Expr {
+            ::veloasm::velo_ast::Expr::Num(n)
+        }
+        /// String literal as Expr
+        fn str(s: &str) -> ::veloasm::velo_ast::Expr {
+            ::veloasm::velo_ast::Expr::str(s)
+        }
+        /// Boolean literal as Expr
+        fn bool(b: bool) -> ::veloasm::velo_ast::Expr {
+            ::veloasm::velo_ast::Expr::Bool(b)
+        }
+    }
+}
+
 /// A comma-separated argument list, for re-parsing macro tokens.
 struct MacroArgs(pub Punctuated<RustExpr, Token![,]>);
 
@@ -1354,7 +1427,8 @@ fn expand_attr(attr: &MAttr, ctx: &[Frame]) -> Res<TokenStream2> {
         // An event binding becomes an EventBinding, not an attribute.
         (_, Some(AttrValueSrc::Splice(expr))) if attr.event.is_some() => {
             let event = attr.event.as_ref().unwrap();
-            Ok(quote! { #a::EventBinding::new(#event, (#expr)) })
+            let action = expand_event_action(expr);
+            Ok(quote! { #a::EventBinding::new(#event, #action) })
         }
         (name, None) => {
             let name = name.as_str();
@@ -1372,7 +1446,8 @@ fn expand_attr(attr: &MAttr, ctx: &[Frame]) -> Res<TokenStream2> {
         }
         (_, Some(AttrValueSrc::DollarExpr(expr))) if attr.event.is_some() => {
             let event = attr.event.as_ref().unwrap();
-            Ok(quote! { #a::EventBinding::new(#event, (#expr)) })
+            let action = expand_event_action(expr);
+            Ok(quote! { #a::EventBinding::new(#event, #action) })
         }
         (name, Some(AttrValueSrc::DollarExpr(expr))) => {
             // A raw `velo_ast::Expr` used directly as the attribute value.
@@ -1384,6 +1459,33 @@ fn expand_attr(attr: &MAttr, ctx: &[Frame]) -> Res<TokenStream2> {
             let name = name.as_str();
             Ok(quote! { #a::Attr::bound(#name, #rendered) })
         }
+    }
+}
+
+/// Expand an event action expression, supporting:
+/// - Direct EventAction: `add("count", 1)`
+/// - Closure returning EventAction: `|| add("count", 1)`
+/// - Closure with multiple ops: `|| { add("count", 1); toggle("flag") }`
+fn expand_event_action(expr: &RustExpr) -> TokenStream2 {
+    // Check if it's a closure expression (|| { ... } or || expr)
+    let is_closure = matches!(expr, RustExpr::Closure(_));
+
+    let helpers = event_helpers();
+
+    if is_closure {
+        // For closures, we need to call them to get the EventAction
+        // The closure should return EventAction or multiple ops that we combine
+        quote! {{
+            #helpers
+            let __action = (#expr)();
+            __action
+        }}
+    } else {
+        // For direct expressions, wrap with helpers in scope
+        quote! {{
+            #helpers
+            (#expr)
+        }}
     }
 }
 

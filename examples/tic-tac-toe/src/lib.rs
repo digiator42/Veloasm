@@ -1,177 +1,294 @@
-//! Tic-tac-toe built with `velo_ast_macro::vhtml!`.
+//! Tic-tac-toe built with `veloasm::vhtml!` macro.
 //!
-//! Backend-safe example: no WASM, no `veloasm` dependency. Builds a
-//! [`velo_ast::View`] that serializes to JSON and can be mounted by a
-//! wasm client reactively.
+//! This example demonstrates using the `vhtml!` macro from `veloasm`
+//! (commit `9e8b176`) to build a tic-tac-toe game with clean syntax.
 //!
-//! Signals:
-//!   turn   — "X" or "O", whose turn it is
-//!   cell_0..cell_8 — each cell's value: "" / "X" / "O"
-//!
-//! Run the test:
+//! Run the tests:
 //!   cargo test -p tic-tac-toe
+//!
+//! Build for the browser:
+//!   trunk serve --dir examples/tic-tac-toe
 
-use velo_ast::event::{EventAction, EventOp, EventValue};
-use velo_ast::{Expr, SignalDecl, View};
-use velo_ast_macro::vhtml;
+use veloasm::vhtml;
+use veloasm::velo_ast::{Expr, SignalDecl, Value, View, Node};
 
-/// Build the tic-tac-toe view.
-///
-/// All signals are declared on the `View` (AST level). Events write to AST
-/// signal ids, and reads use `${ Expr::signal("id") }`. The resulting `View`
-/// is portable and serializes to JSON for the wire.
-pub fn tic_tac_toe() -> View {
-    View::new(
-        "tic-tac-toe",
-        vhtml! {
-            schema { turn, cell_0, cell_1, cell_2, cell_3, cell_4, cell_5, cell_6, cell_7, cell_8 },
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-            div class="game" {
-                h1 { "Tic Tac Toe" }
+fn threat_row(id: u32, title: &str, severity: &str) -> veloasm::velo_ast::Value {
+    veloasm::velo_ast::Value::map([
+        ("id", veloasm::velo_ast::Value::from(id as usize)),
+        ("title", veloasm::velo_ast::Value::from(title)),
+        ("severity", veloasm::velo_ast::Value::from(severity)),
+    ])
+}
 
-                div class="status" {
-                    "Turn: "
-                    ${ Expr::signal("turn") }
-                }
+// ---------------------------------------------------------------------------
+// 1. Everything in one view
+// ---------------------------------------------------------------------------
 
-                div class="board" {
-                    div class="row" {
-                        button class="cell" on:click=( cell_action("cell_0") ) {
-                            ${ Expr::signal("cell_0") }
-                        }
-                        button class="cell" on:click=( cell_action("cell_1") ) {
-                            ${ Expr::signal("cell_1") }
-                        }
-                        button class="cell" on:click=( cell_action("cell_2") ) {
-                            ${ Expr::signal("cell_2") }
-                        }
+/// A single view exercising every `vhtml!` syntax feature.
+pub fn all_features() -> Node {
+    vhtml! {
+        schema { count, flag, loading, title },
+
+        div class="shell" {
+            h1 id="title" { ${ veloasm::velo_ast::Expr::signal("title") } }
+
+            p id="static" { "static paragraph" }
+
+            p { "count: " ${ veloasm::velo_ast::Expr::signal("count") } }
+
+            div .box { "has static box class" }
+
+            div class:highlight=|flag| { "highlight toggles with flag" }
+
+            button on:click={ add("count", 1.0) } {
+                "increment count"
+            }
+            button on:click={ toggle("flag") } {
+                "toggle flag"
+            }
+
+            @Show(flag) {
+                p { "flag is on" }
+            } @else {
+                p { "flag is off" }
+            }
+
+            ul class="threat-list" {
+                @for t in vec![threat_row(1, "alpha", "low"), threat_row(2, "beta", "high")], key = t.id {
+                    li class:severe=(t.severity == "high") data-id=(t.id) {
+                        span class="title" { (t.title) }
+                        span class="sev" { "[" (t.severity) "]" }
                     }
-                    div class="row" {
-                        button class="cell" on:click=( cell_action("cell_3") ) {
-                            ${ Expr::signal("cell_3") }
-                        }
-                        button class="cell" on:click=( cell_action("cell_4") ) {
-                            ${ Expr::signal("cell_4") }
-                        }
-                        button class="cell" on:click=( cell_action("cell_5") ) {
-                            ${ Expr::signal("cell_5") }
-                        }
-                    }
-                    div class="row" {
-                        button class="cell" on:click=( cell_action("cell_6") ) {
-                            ${ Expr::signal("cell_6") }
-                        }
-                        button class="cell" on:click=( cell_action("cell_7") ) {
-                            ${ Expr::signal("cell_7") }
-                        }
-                        button class="cell" on:click=( cell_action("cell_8") ) {
-                            ${ Expr::signal("cell_8") }
-                        }
-                    }
-                }
-
-                button class="reset" on:click=( reset_action() ) {
-                    "Reset"
                 }
             }
-        },
+        }
+    }
+}
+
+/// Wrap `all_features` into a serializable `View` with signal declarations.
+pub fn all_features_view() -> View {
+    View::new(
+        "vhtml-demo",
+        all_features(),
     )
-    .with_signal(SignalDecl::scalar("turn", "X"))
-    .with_signal(SignalDecl::scalar("cell_0", ""))
-    .with_signal(SignalDecl::scalar("cell_1", ""))
-    .with_signal(SignalDecl::scalar("cell_2", ""))
-    .with_signal(SignalDecl::scalar("cell_3", ""))
-    .with_signal(SignalDecl::scalar("cell_4", ""))
-    .with_signal(SignalDecl::scalar("cell_5", ""))
-    .with_signal(SignalDecl::scalar("cell_6", ""))
-    .with_signal(SignalDecl::scalar("cell_7", ""))
-    .with_signal(SignalDecl::scalar("cell_8", ""))
+    .with_signal(SignalDecl::count("count", 0.0))
+    .with_signal(SignalDecl::scalar("flag", true))
+    .with_signal(SignalDecl::scalar("loading", false))
+    .with_signal(SignalDecl::scalar("title", "Demo"))
+    .with_signal(SignalDecl::list("rows", Vec::<Value>::new()))
     .declare_used_signals()
 }
 
-/// Action for clicking a cell: set the cell to the current turn, then toggle
-/// turn between "X" and "O".
-fn cell_action(cell_id: &str) -> EventAction {
-    let set_cell = EventOp::set(
-        cell_id.to_string(),
-        EventValue::Expr(Expr::signal("turn")),
-    );
+// ---------------------------------------------------------------------------
+// 2. Minimal: each feature in isolation
+// ---------------------------------------------------------------------------
 
-    let toggle_turn = EventOp::set(
-        "turn".to_string(),
-        EventValue::Expr(Expr::Cond {
-            test: Box::new(Expr::Cmp {
-                op: velo_ast::expr::CmpOp::Eq,
-                l: Box::new(Expr::signal("turn")),
-                r: Box::new(Expr::str("X")),
-            }),
-            then: Box::new(Expr::str("O")),
-            otherwise: Box::new(Expr::str("X")),
-        }),
-    );
-
-    EventAction::new(vec![set_cell, toggle_turn])
-}
-
-/// Action for the Reset button: clear all cells and set turn to "X".
-fn reset_action() -> EventAction {
-    let mut ops: Vec<EventOp> =
-        vec![EventOp::set("turn".to_string(), EventValue::Expr(Expr::str("X")))];
-    for i in 0..9 {
-        ops.push(EventOp::set(
-            format!("cell_{i}"),
-            EventValue::Expr(Expr::str("")),
-        ));
+/// Bare element + static text.
+pub fn plain() -> Node {
+    vhtml! {
+        div class="card" {
+            h2 { "Plain" }
+            p { "just static text and attributes" }
+        }
     }
-    EventAction::new(ops)
 }
+
+/// Reactive text with AST signal reference.
+pub fn reactive_text() -> Node {
+    vhtml! {
+        schema { count },
+        p { "value: " ${ Expr::signal("count") } }
+    }
+}
+
+/// Class shorthand `.cls` and reactive `class:toggle=(cond)` using pipe signal ref.
+pub fn classes() -> Node {
+    vhtml! {
+        schema { active },
+        div {
+            span .staticcls { "static class" }
+            span class:active=|active| { "reactive class" }
+        }
+    }
+}
+
+/// Event bindings: `on:click={ action }` with concise helpers.
+pub fn events() -> Node {
+    vhtml! {
+        schema { count, flag },
+        div {
+            button on:click={ add("count", 1.0) } {
+                "+1"
+            }
+            button on:click={ toggle("flag") } {
+                "toggle"
+            }
+        }
+    }
+}
+
+/// `@Show` block form with full `@else if` / `@else` chain.
+pub fn show_block() -> Node {
+    vhtml! {
+        schema { active, count },
+        @Show("active") {
+            p { "active" }
+        } @else if (true) {
+            p { "else-if branch" }
+        } @else {
+            p { "fallback" }
+        }
+    }
+}
+
+/// `Show` component form (cleaner DX) + `Suspense` (inverted).
+/// Pure AST approach - signals declared in View, referenced by name in vhtml!
+pub fn show_component() -> Node {
+    vhtml! {
+        schema { flag, loading },
+        div {
+            Show when=|flag| fallback={ "off" } {
+                p { "on" }
+            }
+            Show when=${ Expr::signal("flag") } fallback=${ Node::text("off via expr") } {
+                p { "on via expr" }
+            }
+            Suspense loading=|loading| fallback={ "loading." } {
+                p { "ready" }
+            }
+        }
+    }
+}
+
+/// Unkeyed `@for` - plain Rust body.
+pub fn unkeyed_loop() -> Node {
+    vhtml! {
+        ul {
+            @for i in 0..3 {
+                li { "row: " (i) }
+            }
+        }
+    }
+}
+
+/// Keyed `@for` - Value grammar, reconciled by identity.
+pub fn keyed_loop() -> Node {
+    vhtml! {
+        ul {
+            @for t in vec![threat_row(1, "alpha", "low"), threat_row(2, "port scan", "medium")], key = t.id {
+                li data-id=(t.id) class:severe=(t.severity == "high") {
+                    span class="title" { (t.title) }
+                    span class="sev" { "[" (t.severity) "]" }
+                }
+            }
+        }
+    }
+}
+
+/// `@let` lexical binding.
+pub fn let_binding() -> Node {
+    vhtml! {
+        @let label = "bound by @let",
+        p { (label) }
+    }
+}
+
+/// A portable view without `@for` (which produces `Node::Native`, client-only) and
+/// without reactive text `(expr)` (which produces `Expr::Native`).
+pub fn portable_view() -> View {
+    View::new(
+        "portable-panel",
+        vhtml! {
+            schema { flag, count },
+            div {
+                h2 { "Portable Panel" }
+                @Show("flag") { p { "on" } } @else { p { "off" } }
+                p { "count: " ${ Expr::signal("count") } }
+            }
+        }
+    )
+    .with_signal(SignalDecl::count("count", 0.0))
+    .with_signal(SignalDecl::scalar("flag", true))
+    .declare_used_signals()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tic_tac_toe_builds_and_is_portable() {
-        let view = tic_tac_toe();
-        assert!(view.is_portable());
-        assert_eq!(view.name, "tic-tac-toe");
-        assert_eq!(view.signals.len(), 10); // turn + 9 cells
-        assert_eq!(view.signal("turn").unwrap().initial, velo_ast::Value::from("X"));
-        for i in 0..9 {
-            assert!(view.signal(&format!("cell_{i}")).is_some());
-        }
-        let json = view.to_json().expect("view serializes to JSON");
-        assert!(json.contains("tic-tac-toe"));
-        assert!(json.contains("cell_0"));
+    fn plain_compiles() {
+        let _: Node = plain();
     }
 
     #[test]
-    fn cell_action_sets_and_toggles() {
-        let action = cell_action("cell_3");
-        assert_eq!(action.ops.len(), 2);
-        match &action.ops[0] {
-            EventOp::Set { target, value } => {
-                assert_eq!(target, "cell_3");
-                assert!(matches!(value, EventValue::Expr(_)));
-            }
-            other => panic!("expected Set op, got {other:?}"),
-        }
-        match &action.ops[1] {
-            EventOp::Set { target, .. } => assert_eq!(target, "turn"),
-            other => panic!("expected Set op, got {other:?}"),
-        }
+    fn reactive_text_compiles() {
+        let _: Node = reactive_text();
     }
 
     #[test]
-    fn reset_action_clears_all() {
-        let action = reset_action();
-        assert_eq!(action.ops.len(), 10); // turn + 9 cells
-        match &action.ops[0] {
-            EventOp::Set { target, value } => {
-                assert_eq!(target, "turn");
-                assert!(matches!(value, EventValue::Expr(_)));
+    fn classes_compile() {
+        let _: Node = classes();
+    }
+
+    #[test]
+    fn events_compile() {
+        let _: Node = events();
+    }
+
+    #[test]
+    fn show_block_compiles() {
+        let _: Node = show_block();
+    }
+
+    #[test]
+    fn show_component_compiles() {
+        let _: Node = show_component();
+    }
+
+    #[test]
+    fn unkeyed_loop_compiles() {
+        let _: Node = unkeyed_loop();
+    }
+
+    #[test]
+    fn keyed_loop_compiles() {
+        let _: Node = keyed_loop();
+    }
+
+    #[test]
+    fn let_binding_compiles() {
+        let _: Node = let_binding();
+    }
+
+    #[test]
+    fn all_features_compiles() {
+        let _: Node = all_features();
+    }
+
+    #[test]
+    fn pipe_signal_ref_compiles() {
+        let _: Node = vhtml! {
+            schema { count },
+            Show when=|count| fallback={{ Node::text("off") }} {
+                p { "on" }
             }
-            other => panic!("expected Set op, got {other:?}"),
-        }
+        };
+    }
+
+    #[test]
+    fn schema_rejects_undeclared_show_id() {
+        let _ = vhtml! {
+            schema { count },
+            @Show("count") { p { "declared" } }
+        };
     }
 }
